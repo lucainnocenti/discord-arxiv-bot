@@ -6,3 +6,4 @@ __pycache__/
 config.py
 script.sh
 bot.log
+last_check_date.txt
