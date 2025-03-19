@@ -7,18 +7,21 @@ import logging   ### ADDED
 import config
 from datetime import datetime, timedelta
 
+# Get the directory where the current script is located
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Build the absolute path for the log file
+log_path = os.path.join(script_dir, "bot.log")
+
 # ----------------------------------------------------------------------------
 # Logging Setup
 # ----------------------------------------------------------------------------
-### ADDED/CHANGED
-# This sets up logging so that it logs INFO and above to both a file (bot.log)
-# and also to the console. Adjust logging level/format as desired.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        logging.FileHandler("bot.log"),    # log to file
+        logging.FileHandler(log_path),    # log to file
         logging.StreamHandler(sys.stdout)  # also log to console
     ]
 )
@@ -26,7 +29,7 @@ logging.basicConfig(
 
 DISCORD_TOKEN = config.DISCORD_TOKEN
 CHANNEL_ID = config.CHANNEL_ID
-LAST_CHECK_FILE = "last_check_date.txt"
+LAST_CHECK_FILE = os.path.join(script_dir, "last_check_date.txt")
 
 # List of Authors to Track
 TARGET_AUTHORS = [
