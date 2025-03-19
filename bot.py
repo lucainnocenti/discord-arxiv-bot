@@ -78,11 +78,14 @@ def get_last_check_date():
                 return datetime.fromisoformat(date_str)
         except Exception as e:
             logging.error(f"Error reading last check date: {e}")
-            # Default to 7 days ago if file exists but can't be read
-            return datetime.now() - timedelta(days=7)
+            # Default to 1 days ago if file exists but can't be read
+            return datetime.now() - timedelta(days=1)
     else:
-        # Default to 7 days ago if file doesn't exist
-        return datetime.now() - timedelta(days=7)
+        # create the file if 1 day ago as date, if it doesn't exist
+        newdate = datetime.now() - timedelta(days=1)
+        with open(LAST_CHECK_FILE, 'w') as f:
+            f.write(newdate.isoformat())
+        return newdate
 
 def save_last_check_date():
     try:
@@ -115,13 +118,15 @@ class ArxivBot(discord.Client):
 
         # Build a combined query string using OR operator for all target authors
         combined_query = f'cat:quant-ph AND (' + ' OR '.join(f'au:"{author}"' for author in TARGET_AUTHORS) + ')'
+        # Add date range to the query
+        combined_query += f' AND submittedDate:[{last_check_date.strftime("%Y%m%d")} TO 99999999]'
         logging.info(f"Constructed combined query: {combined_query}")
 
         search = arxiv.Search(
             query=combined_query,
             max_results=50,  # Adjust max_results as needed
             sort_by=arxiv.SortCriterion.SubmittedDate,
-            sort_order=arxiv.SortOrder.Descending,
+            sort_order=arxiv.SortOrder.Ascending,
         )
         logging.info("Performing combined search on arXiv...")
 
@@ -130,36 +135,36 @@ class ArxivBot(discord.Client):
             results = await loop.run_in_executor(None, lambda: list(client.results(search)))
             logging.info(f"Found {len(results)} papers with the combined query.")
             
-            # Sort results by publication date (oldest to newest)
-            results = sorted(results, key=lambda r: r.published.replace(tzinfo=None))
-            
             papers_posted = 0
             for result in results:
-                published_naive = result.published.replace(tzinfo=None)
-                # Only consider papers published after the last check date
-                if published_naive <= last_check_date:
-                    logging.info(
-                        f"Skipping '{result.title}' (published {result.published}) "
-                        "because it is older than last check date."
-                    )
-                    continue
-
                 arxiv_id = result.entry_id
                 if arxiv_id in posted_papers:
                     logging.info(f"Already posted '{result.title}', skipping.")
                     continue
 
                 result_authors = [a.name for a in result.authors]
-                # Determine which of the target authors are present in this result
+
+                # Determine which of the target authors are present in this result (order as in TARGET_AUTHORS)
                 target_authors_in_result = [
                     name for name in TARGET_AUTHORS 
                     if any(name.lower() in author.lower() for author in result_authors)
                 ]
 
-                if not target_authors_in_result:
-                    # Should not happen due to the query but just in case
-                    continue
-                elif len(target_authors_in_result) == 1:
+                # Check if the paper's first author is one of our target authors
+                first_author = result_authors[0] if result_authors else ""
+                target_first_author = None
+                for target in TARGET_AUTHORS:
+                    if target.lower() in first_author.lower():
+                        target_first_author = target
+                        break
+
+                # Reorder the list so that if the first author is a target, it appears first
+                if target_first_author and target_first_author in target_authors_in_result:
+                    target_authors_in_result.remove(target_first_author)
+                    target_authors_in_result.insert(0, target_first_author)
+
+                # Build the string to be printed
+                if len(target_authors_in_result) == 1:
                     target_authors_str = target_authors_in_result[0]
                 else:
                     target_authors_str = (
@@ -172,6 +177,20 @@ class ArxivBot(discord.Client):
                 title = result.title
                 link = result.entry_id  # Typically the paper URL
                 published_str = result.published.strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Check if one of our target authors is the first author
+                first_author = result_authors[0] if result_authors else ""
+                first_author_is_target = False
+                target_first_author = None
+                
+                # Find which target author (if any) is the first author
+                for target in TARGET_AUTHORS:
+                    if target.lower() in first_author.lower():
+                        first_author_is_target = True
+                        target_first_author = target
+                        break
+                
+                # Create the message with target authors (without special annotations)
                 message = (
                     f"📄 **New paper by {target_authors_str}:**\n"
                     f"**Title:** {title}\n"
@@ -179,6 +198,7 @@ class ArxivBot(discord.Client):
                     f"**Published:** {published_str}\n"
                     f"🔗 <{link}>"
                 )
+                
                 logging.info(
                     f"Sending message for paper: '{title}' with target authors: {target_authors_str}."
                 )
