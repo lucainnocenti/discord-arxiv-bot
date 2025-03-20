@@ -42,7 +42,7 @@ TARGET_AUTHORS = [
     # Postdoctoral Researchers
     'Alessandro Candeloro',
     'Silvia Casulleras',
-    'Diana Chisholm',
+    'Diana Chisholm', 'Diana A. Chisholm',
     'Paolo Erdman',
     'Andris Erglis',
     'Luca Leonforte',
@@ -68,13 +68,13 @@ TARGET_AUTHORS = [
     'Davide Valenti',
     'Luca Innocenti',
     'Gabriele Lo Monaco',
-    'Federico Roccati',
+    'Federico Roccati', 'F. Roccati',
     'Angelo Carollo',
     'Francesco Ciccarello',
     'Umberto De Giovannini',
     'Salvatore Lorenzo',
     'Mauro Paternostro',
-    'Massimo Palma'
+    'Massimo Palma', 'G. Massimo Palma', 'G Massimo Palma'
 ]
 
 # Mapping from author names to their Discord user IDs.
@@ -89,7 +89,7 @@ AUTHOR_DISCORD_IDS = {
     'Alessandro Candeloro': 971133750400409702,
     'Luca Innocenti': 1013801241295454268,
     'Salvatore Lorenzo': 1061678209395064913,
-    'Federico Roccati': 1217856447954550798,
+    'Federico Roccati': 1217856447954550798, 'F. Roccati': 1217856447954550798,
     'Simone Artini': 1274736141677101126,
     'Enrico Di Benedetto': 1333213675590385725,
     'Francesco Ciccarello': 1345712941252476928,
@@ -100,7 +100,7 @@ AUTHOR_DISCORD_IDS = {
     'Margherita Valenza': 1350097513830678590,
     'Andris Erglis': 1350161863236915220,
     'Marco Vetrano': 1351138100482674749,
-    'Diana Chisholm': 1351191622922141717,
+    'Diana Chisholm': 1351191622922141717, 'Diana A. Chisholm': 1351191622922141717,
     'Qunipa': 1351589373552099409,
     'Michał Wójcik': 1351905665643319357
 }
@@ -161,8 +161,9 @@ def build_target_authors_string(result_authors, target_authors, author_discord_i
     # Identify target authors in the result while preserving the order defined in target_authors.
     target_in_result = [
         name for name in target_authors
-        if any(name.lower() in author.lower() for author in result_authors)
+        if any(name.lower() == author.lower() for author in result_authors)
     ]
+    print('___', target_in_result)
     if not target_in_result:
         return "unknown"
 
@@ -231,6 +232,7 @@ class ArxivBot(discord.Client):
 
             papers_posted = 0
             for result in results:
+
                 arxiv_id = result.entry_id
                 if arxiv_id in posted_papers:
                     logging.info(f"Already posted '{result.title}', skipping.")
