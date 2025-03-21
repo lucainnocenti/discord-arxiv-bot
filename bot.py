@@ -36,74 +36,10 @@ logging.basicConfig(
 # ----------------------------------------------------------------------------
 DISCORD_TOKEN = config.DISCORD_TOKEN   # Bot's Discord authentication token
 CHANNEL_ID = config.CHANNEL_ID         # Channel ID where messages are sent
+TARGET_AUTHORS = config.TARGET_AUTHORS  # List of target authors
+AUTHOR_DISCORD_IDS = config.AUTHOR_DISCORD_IDS  # Mapping from author names to their Discord user IDs.
 
-# List of target authors (organized by role)
-TARGET_AUTHORS = [
-    # Postdoctoral Researchers
-    'Alessandro Candeloro',
-    'Silvia Casulleras',
-    'Diana Chisholm', 'Diana A. Chisholm',
-    'Paolo Erdman',
-    'Andris Erglis',
-    'Luca Leonforte',
-    'Daniele Morrone',
-    'Zhengwei Nie',
-    'Sofia Sgroi',
-    'Xuejian Sun',
-    # PhD Students
-    'Simone Artini',
-    'Duilio De Santis',
-    'Enrico Di Benedetto',
-    'Giovanni Di Fresco',
-    'Subhojit Pal',
-    'Claudio Pellitteri',
-    'Marcel Augusto Pinto',
-    'Alessandro Romancino',
-    'Giovanni Luca Sferrazza',
-    'Marco Vetrano',
-    'Sujan Vijayaraj',
-    # Staff
-    'Daniele Militello',
-    'Anna Napoli',
-    'Davide Valenti',
-    'Luca Innocenti',
-    'Gabriele Lo Monaco',
-    'Federico Roccati', 'F. Roccati',
-    'Angelo Carollo',
-    'Francesco Ciccarello',
-    'Umberto De Giovannini',
-    'Salvatore Lorenzo',
-    'Mauro Paternostro',
-    'Massimo Palma', 'G. Massimo Palma', 'G Massimo Palma'
-]
 
-# Mapping from author names to their Discord user IDs.
-AUTHOR_DISCORD_IDS = {
-    'arxiv-bot': 1351591703533981899,
-    'Luca Leonforte': 199617985005092864,
-    'Alessandro Romancino': 341487911159595008,
-    'Marcel Pinto': 342988898529443841,
-    'Sujan Vijayaraj': 692104371256819864,
-    'Mauro Paternostro': 812610887051247689,
-    'Gabriele Ippolito': 815618974783766578,
-    'Alessandro Candeloro': 971133750400409702,
-    'Luca Innocenti': 1013801241295454268,
-    'Salvatore Lorenzo': 1061678209395064913,
-    'Federico Roccati': 1217856447954550798, 'F. Roccati': 1217856447954550798,
-    'Simone Artini': 1274736141677101126,
-    'Enrico Di Benedetto': 1333213675590385725,
-    'Francesco Ciccarello': 1345712941252476928,
-    'Angelo Carollo': 1345783276337365156,
-    'Giovanni Luca Sferrazza': 1346060835801403392,
-    'Gabriele Lo Monaco': 1346822086961664010,
-    'Silvia Casulleras': 1349764343725817886,
-    'Margherita Valenza': 1350097513830678590,
-    'Andris Erglis': 1350161863236915220,
-    'Marco Vetrano': 1351138100482674749,
-    'Diana Chisholm': 1351191622922141717, 'Diana A. Chisholm': 1351191622922141717,
-    'Qunipa': 1351589373552099409,
-    'Michał Wójcik': 1351905665643319357
-}
 
 # Use a set to track posted papers during runtime.
 posted_papers = set()
