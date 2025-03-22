@@ -16,7 +16,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 # Build the absolute path for the log file.
 log_path = os.path.join(script_dir, "bot.log")
 # Define the file that stores the last time arXiv was checked.
-LAST_CHECK_FILE = os.path.join(script_dir, "last_check_date.txt")
+LAST_SUBMISSION_FILE = os.path.join(script_dir, "last_submission_date.txt")
 
 # ----------------------------------------------------------------------------
 # Logging Setup
@@ -47,15 +47,15 @@ posted_papers = set()
 # ----------------------------------------------------------------------------
 # Helper Functions
 # ----------------------------------------------------------------------------
-def get_last_check_date():
+def get_last_submission_date():
     """
-    Reads the last check date from a file. If the file cannot be read,
+    Reads the last checked date from a file. If the file cannot be read,
     defaults to 1 day ago. If the file doesn't exist, creates it with a date
     set to 1 day ago.
     """
-    if os.path.exists(LAST_CHECK_FILE):
+    if os.path.exists(LAST_SUBMISSION_FILE):
         try:
-            with open(LAST_CHECK_FILE, 'r') as f:
+            with open(LAST_SUBMISSION_FILE, 'r') as f:
                 date_str = f.read().strip()
                 return datetime.fromisoformat(date_str)
         except Exception as e:
@@ -63,29 +63,30 @@ def get_last_check_date():
             return datetime.now() - timedelta(days=1)
     else:
         newdate = datetime.now() - timedelta(days=1)
-        with open(LAST_CHECK_FILE, 'w') as f:
+        with open(LAST_SUBMISSION_FILE, 'w') as f:
             f.write(newdate.isoformat())
         return newdate
 
-def save_last_check_date():
+def save_last_submission_time(time):
     """
-    Saves the current date and time to the LAST_CHECK_FILE, marking the latest check.
+    Saves the time given as argument in LAST_SUBMISSION_FILE.
+    The time should be a datetime object.
     """
     try:
-        with open(LAST_CHECK_FILE, 'w') as f:
-            f.write(datetime.now().isoformat())
-        logging.info(f"Saved current date to {LAST_CHECK_FILE}")
+        with open(LAST_SUBMISSION_FILE, 'w') as f:
+            f.write(time.isoformat())
+        logging.info(f"Saved date {time.isoformat()} to {LAST_SUBMISSION_FILE}")
     except Exception as e:
         logging.error(f"Error saving last check date: {e}")
 
-def build_arxiv_query(last_check_date, target_authors):
+def build_arxiv_query(last_submission_date, target_authors):
     """
     Constructs an arXiv query string for 'quant-ph' papers by target authors
-    submitted after last_check_date.
+    submitted after last_submission_date.
     """
     authors_query = ' OR '.join(f'au:"{author}"' for author in target_authors)
     query = f'cat:quant-ph AND ({authors_query})'
-    query += f' AND submittedDate:[{last_check_date.strftime("%Y%m%d")} TO 99999999]'
+    query += f' AND submittedDate:[{last_submission_date.strftime("%Y%m%d%H%M%S")} TO 99999999]'
     logging.info(f"Constructed combined query: {query}")
     return query
 
@@ -99,7 +100,7 @@ def build_target_authors_string(result_authors, target_authors, author_discord_i
         name for name in target_authors
         if any(name.lower() == author.lower() for author in result_authors)
     ]
-    print('___', target_in_result)
+
     if not target_in_result:
         return "unknown"
 
@@ -147,9 +148,9 @@ class ArxivBot(discord.Client):
         logging.info(f"Posting to channel: {channel}")
 
         # Get last check date and construct query.
-        last_check_date = get_last_check_date()
-        logging.info(f"Checking papers published since: {last_check_date}")
-        query = build_arxiv_query(last_check_date, TARGET_AUTHORS)
+        last_submission_date = get_last_submission_date()
+        logging.info(f"Checking papers published since: {last_submission_date}")
+        query = build_arxiv_query(last_submission_date, TARGET_AUTHORS)
         
         # Set up the arXiv search
         search = arxiv.Search(
@@ -188,6 +189,11 @@ class ArxivBot(discord.Client):
                 title = result.title
                 link = result.entry_id  # Typically the paper URL
                 published_str = result.published.strftime('%Y-%m-%d %H:%M:%S')
+                logging.info(f"Found new paper: '{title}' by {target_authors_str}, submitted on {published_str}.")
+
+                # Check if the submission date is the latest among the papers found.
+                if result.published.replace(tzinfo=None) > last_submission_date:
+                    last_submission_date = result.published.replace(tzinfo=None)
 
                 # Construct the message.
                 message = (
@@ -203,7 +209,14 @@ class ArxivBot(discord.Client):
                 papers_posted += 1
 
             logging.info(f"Posted {papers_posted} new papers.")
-            save_last_check_date()
+
+            # Save the last submission date to the file, if any papers were posted.
+            if papers_posted > 0:
+                # log last submission date found
+                logging.info(f"Last submission date found: {last_submission_date}")
+                # save last submission date PLUS ONE SECOND (to avoid duplicates)
+                save_last_submission_time(last_submission_date + timedelta(seconds=1))
+
         except Exception as e:
             logging.exception(f"Error during combined query processing: {e}")
 
