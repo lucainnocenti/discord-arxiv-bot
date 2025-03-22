@@ -215,6 +215,7 @@ class ArxivBot(discord.Client):
                 # log last submission date found
                 logging.info(f"Last submission date found: {last_submission_date}")
                 # save last submission date PLUS ONE SECOND (to avoid duplicates)
+                # if you publish HALF A SECOND after the last submission but somehow end up in a different announcement, please reconsider your life choices
                 save_last_submission_time(last_submission_date + timedelta(seconds=1))
 
         except Exception as e:
