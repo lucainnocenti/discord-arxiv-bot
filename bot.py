@@ -1,24 +1,34 @@
-import discord          # Discord library to interact with the Discord API
-import asyncio          # For asynchronous event handling and scheduling tasks
-import arxiv            # For querying the arXiv API for research papers
-import os               # For file path and OS interactions
-import sys              # For system-specific parameters and functions
-import logging          # For logging messages to both console and file
-import config           # Module to import configuration data such as tokens and IDs
-from datetime import datetime, timedelta  # For date and time handling
-import feedparser
-from typing import List, Dict, Any
+import discord                           # Discord library to interact with the Discord API
+import asyncio                           # For asynchronous event handling and scheduling tasks
+import arxiv                             # For querying the arXiv API for research papers
+import os                                # For file path and OS interactions
+import sys                               # For system-specific parameters and functions
+import logging                           # For logging messages to both console and file
+import config                            # Module to import configuration data such as tokens and IDs
+from datetime import datetime, timedelta # For date and time handling
+import feedparser                        # For parsing RSS feeds
+from typing import List, Dict, Any, Optional  # For type annotations
+from pylatexenc.latex2text import LatexNodes2Text
+
+
+# ----------------------------------------------------------------------------
+def decode_author_name(name: str) -> str:
+    """
+    Converts LaTeX-style encoded strings (e.g. "Albarr\\'an") to proper Unicode.
+    """
+    return LatexNodes2Text().latex_to_text(name)
+
 
 # ----------------------------------------------------------------------------
 # File and Directory Setup
 # ----------------------------------------------------------------------------
 # Determine the directory where the current script is located.
-script_dir = os.path.dirname(os.path.abspath(__file__))
+script_dir: str = os.path.dirname(os.path.abspath(__file__))
 
 # Build the absolute path for the log file.
-log_path = os.path.join(script_dir, "bot.log")
+log_path: str = os.path.join(script_dir, "bot.log")
 # Define the file that stores the last time arXiv was checked.
-LAST_SUBMISSION_FILE = os.path.join(script_dir, "last_submission_date.txt")
+LAST_SUBMISSION_FILE: str = os.path.join(script_dir, "last_submission_date.txt")
 
 # ----------------------------------------------------------------------------
 # Logging Setup
@@ -36,98 +46,193 @@ logging.basicConfig(
 # ----------------------------------------------------------------------------
 # Configuration and Constants
 # ----------------------------------------------------------------------------
-DISCORD_TOKEN = config.DISCORD_TOKEN   # Bot's Discord authentication token
-CHANNEL_ID = config.CHANNEL_ID         # Channel ID where messages are sent
-TARGET_AUTHORS = config.TARGET_AUTHORS  # List of target authors
-AUTHOR_DISCORD_IDS = config.AUTHOR_DISCORD_IDS  # Mapping from author names to their Discord user IDs.
+DISCORD_TOKEN: str = config.DISCORD_TOKEN   # Bot's Discord authentication token
+CHANNEL_ID: int = config.CHANNEL_ID         # Channel ID where messages are sent
+TARGET_AUTHORS: List[str] = config.TARGET_AUTHORS  # List of target authors
+AUTHOR_DISCORD_IDS: Dict[str, str] = config.AUTHOR_DISCORD_IDS  # Mapping from author names to their Discord user IDs
 
+# Global set to track posted papers during runtime (using paper IDs)
+posted_papers: set = set()
 
-
-# Use a set to track posted papers during runtime.
-posted_papers = set()
-
+# ----------------------------------------------------------------------------
+# Paper Fetching Functions
+# ----------------------------------------------------------------------------
 def get_latest_papers_from_rss(category: str = "quant-ph", max_results: int = 100) -> List[Dict[str, Any]]:
     """
-    Fetches latest papers from arXiv RSS feed for a given category.
+    Fetches the latest papers from the arXiv RSS feed for a given category and filters
+    the papers by target authors (ignoring the published date because the RSS feed returns
+    the same date for all entries).
     
     Args:
-        category: arXiv category (default: "quant-ph")
-        max_results: Maximum number of results to return (default: 100)
+        category: The arXiv category (default: "quant-ph").
+        max_results: Maximum number of results to process (default: 100).
     
     Returns:
-        List of dictionaries containing paper details with keys:
-        - title: Title of the paper
-        - authors: List of author names
-        - published: Publication date (string)
-        - updated: Last updated date (string)
-        - summary: Abstract of the paper
-        - link: URL to the paper
-        - pdf_link: Direct link to PDF (if available)
-        - journal_ref: Journal reference (if available)
+        A list of dictionaries containing normalized paper details that match the target authors.
     """
-
-    # Parse the RSS feed
-    feed_url = f"http://rss.arxiv.org/rss/{category}"
+    feed_url: str = f"http://rss.arxiv.org/rss/{category}"
     feed = feedparser.parse(feed_url)
-
-    # Process results
-    papers = []
+    papers: List[Dict[str, Any]] = []
+    
     for entry in feed.entries[:max_results]:
-        # Extract authors
-        authors = [author.get('name', '') for author in (entry.get('authors') or [])]
+        # Extract authors from the RSS entry; each author is a dictionary.
+        # authors: List[str] = entry['authors'][0]['name'].split(', ')
+        authors: List[str] = [
+            decode_author_name(author)
+            for author in entry['authors'][0]['name'].split(', ')
+        ]
         
-        # Create PDF link from the main link
-        paper_id = entry.id.split('/abs/')[-1]
-        pdf_link = f"http://arxiv.org/pdf/{paper_id}"
+        # Only include the paper if at least one author matches one of the TARGET_AUTHORS (case-insensitive).
+        if not any(target.lower() == author.lower() for target in TARGET_AUTHORS for author in authors):
+            continue
+        
+        # Build the PDF link using the paper ID extracted from the entry URL.
+        paper_id: str = entry.id.split('/abs/')[-1]
+        pdf_link: str = f"http://arxiv.org/pdf/{paper_id}"
+        
+        # Parse the published date from the RSS feed (should just be midnight eastern US time).
+        try:
+            published_dt: datetime = datetime.strptime(entry.published, '%a, %d %b %Y %H:%M:%S %z')
+        except Exception as e:
+            logging.error(f"Error parsing date for entry {entry.id}: {e}")
+            continue  # Skip entries with parsing errors
 
-        # the rss times are in the format 'Mon, 24 Mar 2025 00:00:00 -0400'. Convert to datetime object
-        entry.published = datetime.strptime(entry.published, '%a, %d %b %Y %H:%M:%S %z')
-        
-        paper = {
+        # the entry.summary returned by the RSS includes a bunch of info BEFORE the actual abstract (which starts after the string "Abstract: "). Remove it.
+        summary = entry.summary.split("Abstract: ")[1]
+
+        # Create a normalized paper dictionary.
+        paper: Dict[str, Any] = {
+            'id': entry.id,
             'title': entry.title,
             'authors': authors,
-            'published': entry.published,
-            'summary': entry.summary,
-            'type': entry.arxiv_announce_type,
+            'published': published_dt,
+            'summary': summary,
             'link': entry.link,
             'pdf_link': pdf_link,
-            'journal_ref': entry.get('arxiv_journal_reference', 'None')
+            'journal_ref': entry.get('arxiv_journal_reference', None),
+            'announce_type': entry.arxiv_announce_type
         }
-        
+
+        print('Huston, we have a paper:', paper)
         papers.append(paper)
     
     return papers
 
-# ----------------------------------------------------------------------------
-# Helper Functions
-# ----------------------------------------------------------------------------
-def get_last_submission_date():
+async def get_latest_papers_from_api(last_submission_date: datetime, category: str = "quant-ph", max_results: int = 50) -> List[Dict[str, Any]]:
     """
-    Reads the last checked date from a file, unless overridden by command line argument.
+    Fetches the latest papers using the arXiv API. The query filters by target authors and submission date.
+    
+    Args:
+        last_submission_date: The datetime to filter papers (only newer than this date).
+        category: The arXiv category (default: "quant-ph").
+        max_results: Maximum number of results to fetch.
+    
+    Returns:
+        A list of normalized paper dictionaries.
     """
-    # use the date provided via command line if available.
+    # Construct a query string that combines the category, target authors, and submission date filtering.
+    authors_query: str = ' OR '.join(f'au:"{author}"' for author in TARGET_AUTHORS)
+    query: str = f'cat:{category} AND ({authors_query})'
+    query += f' AND submittedDate:[{last_submission_date.strftime("%Y%m%d%H%M%S")} TO 99999999]'
+    logging.info(f"Constructed combined query: {query}")
+
+    search = arxiv.Search(
+        query=query,
+        max_results=max_results,
+        sort_by=arxiv.SortCriterion.SubmittedDate,
+        sort_order=arxiv.SortOrder.Ascending,
+    )
+    
+    # Use an executor to run the blocking API call without freezing the event loop.
+    loop = asyncio.get_event_loop()
+    results = await loop.run_in_executor(None, lambda: list(arxiv.Client().results(search)))
+    
+    papers: List[Dict[str, Any]] = []
+    for result in results:
+        # Build the PDF link from the result entry ID.
+
+        paper_id: str = result.entry_id
+        pdf_link: str = f"http://arxiv.org/pdf/{paper_id.split('/abs/')[-1]}"
+        paper: Dict[str, Any] = {
+            'id': result.entry_id,
+            'title': result.title,
+            'authors': [author.name for author in result.authors],
+            'published': result.published,
+            'summary': result.summary,
+            'link': result.entry_id,  # The entry ID typically serves as the paper URL.
+            'pdf_link': pdf_link,
+            'journal_ref': result.journal_ref,
+            'announce_type': 'new'  # when using the API the announce_type is moot; you can only tell if it was EVER updated or not
+        }
+        papers.append(paper)
+    return papers
+
+
+async def fetch_latest_papers(last_submission_date: datetime, source: str, category: str = "quant-ph", max_results: int = 50) -> List[Dict[str, Any]]:
+    """
+    Fetches and normalizes papers from either the arXiv API or RSS feed based on the selected source.
+    
+    For the RSS source, filtering is handled within get_latest_papers_from_rss (by target authors only).
+    
+    Args:
+        last_submission_date: Only used for the API source (papers submitted after this date).
+        source: A string indicating the source to use ('api' or 'rss').
+        category: The arXiv category to query.
+        max_results: Maximum number of results to fetch.
+    
+    Returns:
+        A list of normalized paper dictionaries.
+    """
+    loop = asyncio.get_event_loop()
+    papers: List[Dict[str, Any]] = []
+    
+    if source == "api":
+        logging.info("Fetching papers using the arXiv API.")
+        papers = await get_latest_papers_from_api(last_submission_date, category, max_results)
+    elif source == "rss":
+        logging.info("Fetching papers using the arXiv RSS feed.")
+        # Run the RSS fetching in an executor to avoid blocking.
+        papers = await loop.run_in_executor(None, lambda: get_latest_papers_from_rss(category, max_results))
+    else:
+        logging.error(f"Unknown source: {source}. Defaulting to API.")
+        papers = await get_latest_papers_from_api(last_submission_date, category, max_results)
+    
+    return papers
+
+
+# ----------------------------------------------------------------------------
+# Helper Functions for Date Management and Author Formatting
+# ----------------------------------------------------------------------------
+def get_last_submission_date() -> datetime:
+    """
+    Reads the last checked date from a file, unless overridden by a command-line argument.
+    
+    Returns:
+        The datetime representing the last time arXiv was checked.
+    """
     if LAST_DATE_OVERRIDE is not None:
         logging.info("Using override date provided via --lastdate argument")
         return LAST_DATE_OVERRIDE
-    # otherwise read the date from the file
     if os.path.exists(LAST_SUBMISSION_FILE):
         try:
             with open(LAST_SUBMISSION_FILE, 'r') as f:
-                date_str = f.read().strip()
+                date_str: str = f.read().strip()
                 return datetime.fromisoformat(date_str)
         except Exception as e:
             logging.error(f"Error reading last check date: {e}")
             return datetime.now() - timedelta(days=1)
     else:
-        newdate = datetime.now() - timedelta(days=1)
+        newdate: datetime = datetime.now() - timedelta(days=1)
         with open(LAST_SUBMISSION_FILE, 'w') as f:
             f.write(newdate.isoformat())
         return newdate
 
-def save_last_submission_time(time):
+def save_last_submission_time(time: datetime) -> None:
     """
-    Saves the time given as argument in LAST_SUBMISSION_FILE.
-    The time should be a datetime object.
+    Saves the provided datetime as the last check date into a file.
+    
+    Args:
+        time: A datetime object to be saved.
     """
     try:
         with open(LAST_SUBMISSION_FILE, 'w') as f:
@@ -136,33 +241,28 @@ def save_last_submission_time(time):
     except Exception as e:
         logging.error(f"Error saving last check date: {e}")
 
-def build_arxiv_query(last_submission_date, target_authors):
+def build_target_authors_string(result_authors: List[str], target_authors: List[str], author_discord_ids: Dict[str, str]) -> str:
     """
-    Constructs an arXiv query string for 'quant-ph' papers by target authors
-    submitted after last_submission_date.
+    Constructs a human-friendly string tagging target authors (using Discord IDs when available).
+    
+    Args:
+        result_authors: List of authors from the paper.
+        target_authors: List of target author names.
+        author_discord_ids: Mapping from author names to their Discord user IDs.
+    
+    Returns:
+        A string with tagged author names or "unknown" if none match.
     """
-    authors_query = ' OR '.join(f'au:"{author}"' for author in target_authors)
-    query = f'cat:quant-ph AND ({authors_query})'
-    query += f' AND submittedDate:[{last_submission_date.strftime("%Y%m%d%H%M%S")} TO 99999999]'
-    logging.info(f"Constructed combined query: {query}")
-    return query
-
-def build_target_authors_string(result_authors, target_authors, author_discord_ids):
-    """
-    Returns a human-friendly string with Discord tagging for target authors found in result_authors.
-    Prioritizes the first author if they match.
-    """
-    # Identify target authors in the result while preserving the order defined in target_authors.
-    target_in_result = [
+    # Identify target authors that appear in the result.
+    target_in_result: List[str] = [
         name for name in target_authors
         if any(name.lower() == author.lower() for author in result_authors)
     ]
-
     if not target_in_result:
         return "unknown"
 
     # Reorder so that if the first author is a target, they appear first.
-    first_author = result_authors[0]
+    first_author: str = result_authors[0]
     for target in target_in_result:
         if target.lower() in first_author.lower():
             target_in_result.remove(target)
@@ -170,129 +270,120 @@ def build_target_authors_string(result_authors, target_authors, author_discord_i
             break
 
     # Build the string by tagging authors when a Discord ID is available.
-    tagged_authors = [
+    tagged_authors: List[str] = [
         f"<@{author_discord_ids[author]}>" if author in author_discord_ids else author
         for author in target_in_result
     ]
     if len(tagged_authors) == 1:
         return tagged_authors[0]
+    # Concatenate all names with commas, with an "and" before the last name.
     return ", ".join(tagged_authors[:-1]) + " and " + tagged_authors[-1]
 
 # ----------------------------------------------------------------------------
 # Discord Bot Class
 # ----------------------------------------------------------------------------
 class ArxivBot(discord.Client):
-    async def on_ready(self):
+    async def on_ready(self) -> None:
         """
-        Called when the bot has successfully connected to Discord.
-        Logs the bot's identity, performs a one-time arXiv check, and then shuts down.
+        Called when the bot successfully connects to Discord.
+        It logs the identity, performs a one-time check for new arXiv papers, and then shuts down.
         """
         logging.info(f"Logged in as {self.user}")
         await self.check_arxiv_once()
-        await self.close()  # Close after processing to avoid a long-running process
+        await self.close()  # Terminate after processing to prevent a long-running process
 
-    async def check_arxiv_once(self):
+    async def check_arxiv_once(self) -> None:
         """
-        Checks for new arXiv papers from target authors since the last check date,
-        constructs messages, and posts them to a specified Discord channel.
+        Checks for new arXiv papers, constructs messages with paper details, and posts them to a Discord channel.
         """
         await self.wait_until_ready()
-        channel = self.get_channel(CHANNEL_ID)
+        channel: Optional[discord.abc.Messageable] = self.get_channel(CHANNEL_ID)
         if channel is None:
             logging.error("ERROR: Could not get channel. Please check CHANNEL_ID!")
             return
 
         logging.info(f"Posting to channel: {channel}")
 
-        # Get last check date and construct query.
-        last_submission_date = get_last_submission_date()
+        # Retrieve the last submission date from storage or override.
+        last_submission_date: datetime = get_last_submission_date()
         logging.info(f"Checking papers published since: {last_submission_date}")
-        query = build_arxiv_query(last_submission_date, TARGET_AUTHORS)
-        
-        # Set up the arXiv search
-        search = arxiv.Search(
-            query=query,
-            max_results=50,  # Adjust maximum results if necessary
-            sort_by=arxiv.SortCriterion.SubmittedDate,
-            sort_order=arxiv.SortOrder.Ascending,
-        )
-        logging.info("Performing search on arXiv...")
 
-        try:
-            # Use an executor to avoid blocking the event loop
-            loop = asyncio.get_event_loop()
-            results = await loop.run_in_executor(None, lambda: list(arxiv.Client().results(search)))
-            logging.info(f"Found {len(results)} papers with the combined query.")
+        # Fetch papers from the selected source (API or RSS)
+        papers: List[Dict[str, Any]] = await fetch_latest_papers(last_submission_date, SOURCE, category="quant-ph", max_results=50)
+        logging.info(f"Found {len(papers)} papers using source '{SOURCE}'.")
 
-            papers_posted = 0
-            for result in results:
+        papers_posted: int = 0
+        for paper in papers:
+            paper_id: str = paper['id']
+            if paper_id in posted_papers:
+                logging.info(f"Already posted '{paper['title']}', skipping.")
+                continue
 
-                arxiv_id = result.entry_id
-                if arxiv_id in posted_papers:
-                    logging.info(f"Already posted '{result.title}', skipping.")
-                    continue
+            # Build a human-friendly string with target authors, using Discord tagging if available.
+            target_authors_str: str = build_target_authors_string(paper['authors'], TARGET_AUTHORS, AUTHOR_DISCORD_IDS)
+            # record the paper ID to avoid reposting it (I don't know why the fuck I do this I'm pretty sure it's pointless)
+            posted_papers.add(paper_id)
 
-                # Extract authors from the result.
-                result_authors = [a.name for a in result.authors]
+            # Truncate the summary if it is too long (b/c fucking Discord doesn't allow messages longer than 2000 characters).
+            summary: str = paper['summary']
+            if len(summary) > 1400:
+                summary = summary[:1400] + '...[continue]'
 
-                # Build a string with target authors and Discord tags.
-                target_authors_str = build_target_authors_string(result_authors, TARGET_AUTHORS, AUTHOR_DISCORD_IDS)
+            published_str: str = paper['published'].strftime('%Y-%m-%d')
+            logging.info(f"Found new paper: '{paper['title']}' by {target_authors_str}, submitted on {published_str}.")
 
-                # Mark the paper as posted.
-                posted_papers.add(arxiv_id)
+            # Update the last submission date if this paper is more recent (this is actually useless for the RSS; needed for the API though)
+            if paper['published'].replace(tzinfo=None) > last_submission_date:
+                last_submission_date = paper['published'].replace(tzinfo=None)
 
-                # Extract relevant information from the result.
-                title = result.title
-                link = result.entry_id  # Typically the paper URL
-                summary = result.summary
-                journal_ref = result.journal_ref
+            # Precompute journal reference line if available.
+            journal_line: str = f"**Journal Reference:** {paper['journal_ref']}\n" if paper.get('journal_ref') else ""
 
-                # if summary is too long, truncate it to 1000 characters
-                if len(summary) > 1400:
-                    summary = summary[:1400] + '[...]'
-
-                published_str = result.published.strftime('%Y-%m-%d %H:%M:%S')
-                logging.info(f"Found new paper: '{title}' by {target_authors_str}, submitted on {published_str}.")
-
-                # Check if the submission date is the latest among the papers found.
-                if result.published.replace(tzinfo=None) > last_submission_date:
-                    last_submission_date = result.published.replace(tzinfo=None)
-
-                # Construct the message.
-                message = (
+            # if we're using the RSS and we find a paper that's an update, and that paper has a journal_ref, we change the announcement message accordingly
+            if SOURCE == "rss" and paper['announce_type'] == 'replace' and paper['journal_ref']:
+                message: str = (
+                    f"📄 **Update to paper by {target_authors_str}**:\n"
+                    f"The arXiv paper <{paper['link']}> was published! Cheers! 🥂🍾\n"
+                    f"**New journal reference:** {paper['journal_ref']}"
+                )
+            # otherwise use the standard message format
+            else:
+                message: str = (
                     f"📄 **New paper by {target_authors_str}:**\n"
-                    f"**Title:** {title}\n"
-                    f"**Authors:** {', '.join(result_authors)}\n"
+                    f"**Title:** {paper['title']}\n"
+                    f"**Authors:** {', '.join(paper['authors'])}\n"
                     f"**Submitted:** {published_str}\n"
                     f"**Abstract:** {summary}\n"
-                    f"{f'**Journal Reference:** {journal_ref}\n' if journal_ref else ''}"
-                    f"🔗 <{link}>"
+                    f"{journal_line}"
+                    f"🔗 <{paper['link']}>"
                 )
-
-                logging.info(f"Sending message for paper: '{title}' with target authors: {target_authors_str}.")
-                # print length of message to console
-                # logging.info(f"Message length: {len(message)}")
+            
+            if NO_SEND:
+                logging.info(f"Skipping Discord message for paper: {paper['title']}")
+            else:
+                logging.info(f"Sending Discord message for paper.")
                 await channel.send(message)
                 papers_posted += 1
 
-            logging.info(f"Posted {papers_posted} new papers.")
+        logging.info(f"Posted {papers_posted} new papers.")
 
-            # Save the last submission date to the file, if any papers were posted.
-            if papers_posted > 0:
-                logging.info(f"Last submission date found: {last_submission_date}")
-                if NO_SAVE:
-                    logging.info("Skipping save of last submission date due to --nosave flag.")
-                else:
-                    save_last_submission_time(last_submission_date + timedelta(seconds=1))
-                    logging.info("Saved last submission date.")
-
-        except Exception as e:
-            logging.exception(f"Error during combined query processing: {e}")
+        # Save the new last submission date if papers were posted (unless --nosave flag is active).
+        if papers_posted > 0:
+            logging.info(f"Last submission date found: {last_submission_date}")
+            if NO_SAVE:
+                logging.info("Skipping save of last submission date due to --nosave flag.")
+            else:
+                # Add a small delta to avoid reprocessing the same paper.
+                save_last_submission_time(last_submission_date + timedelta(seconds=1))
+                logging.info("Saved last submission date.")
 
 # ----------------------------------------------------------------------------
 # Main Async Function to Start the Bot
 # ----------------------------------------------------------------------------
-async def main():
+async def main() -> None:
+    """
+    Main entry point: initializes the Discord bot and handles graceful shutdown.
+    """
     intents = discord.Intents.default()
     bot = ArxivBot(intents=intents)
     try:
@@ -303,7 +394,7 @@ async def main():
         if not bot.is_closed():
             logging.info("Closing bot connection...")
             await bot.close()
-        # Clean up any pending tasks
+        # Cancel any remaining pending tasks.
         pending = asyncio.all_tasks(asyncio.get_event_loop())
         for task in pending:
             if task is not asyncio.current_task():
@@ -322,16 +413,30 @@ async def main():
 # ----------------------------------------------------------------------------
 # Entry Point and Command Line Argument Parsing
 # ----------------------------------------------------------------------------
-NO_SAVE = "--nosave" in sys.argv
-LAST_DATE_OVERRIDE = None
+NO_SAVE: bool = "--nosave" in sys.argv
+NO_SEND: bool = "--nosend" in sys.argv
+LAST_DATE_OVERRIDE: Optional[datetime] = None
+SOURCE: str = "rss"  # Default source is the arXiv API
+
+# Parse command-line arguments for date override and source selection.
 for arg in sys.argv:
     if arg.startswith("--lastdate="):
         try:
-            date_str = arg.split("=", 1)[1]
+            date_str: str = arg.split("=", 1)[1]
             LAST_DATE_OVERRIDE = datetime.fromisoformat(date_str)
             logging.info(f"Overriding last submission date with: {date_str}")
         except Exception as e:
             logging.error(f"Invalid date format for --lastdate argument. Expected ISO format. Error: {e}")
+    if arg.startswith("--source="):
+        source_val: str = arg.split("=", 1)[1].lower()
+        if source_val in {"api", "rss"}:
+            SOURCE = source_val
+            logging.info(f"Using source: {SOURCE}")
+        else:
+            logging.error("Invalid source specified. Valid options are 'api' and 'rss'. Using default 'api'.")
+
+if SOURCE == "rss" and LAST_DATE_OVERRIDE is not None:
+    raise ValueError("Custom lastdate is not allowed when source is 'rss' as they are not compatible.")
 
 if __name__ == "__main__":
     asyncio.run(main())
