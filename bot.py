@@ -6,6 +6,8 @@ import sys              # For system-specific parameters and functions
 import logging          # For logging messages to both console and file
 import config           # Module to import configuration data such as tokens and IDs
 from datetime import datetime, timedelta  # For date and time handling
+import feedparser
+from typing import List, Dict, Any
 
 # ----------------------------------------------------------------------------
 # File and Directory Setup
@@ -44,15 +46,70 @@ AUTHOR_DISCORD_IDS = config.AUTHOR_DISCORD_IDS  # Mapping from author names to t
 # Use a set to track posted papers during runtime.
 posted_papers = set()
 
+def get_latest_papers_from_rss(category: str = "quant-ph", max_results: int = 100) -> List[Dict[str, Any]]:
+    """
+    Fetches latest papers from arXiv RSS feed for a given category.
+    
+    Args:
+        category: arXiv category (default: "quant-ph")
+        max_results: Maximum number of results to return (default: 100)
+    
+    Returns:
+        List of dictionaries containing paper details with keys:
+        - title: Title of the paper
+        - authors: List of author names
+        - published: Publication date (string)
+        - updated: Last updated date (string)
+        - summary: Abstract of the paper
+        - link: URL to the paper
+        - pdf_link: Direct link to PDF (if available)
+        - journal_ref: Journal reference (if available)
+    """
+
+    # Parse the RSS feed
+    feed_url = f"http://rss.arxiv.org/rss/{category}"
+    feed = feedparser.parse(feed_url)
+
+    # Process results
+    papers = []
+    for entry in feed.entries[:max_results]:
+        # Extract authors
+        authors = [author.get('name', '') for author in (entry.get('authors') or [])]
+        
+        # Create PDF link from the main link
+        paper_id = entry.id.split('/abs/')[-1]
+        pdf_link = f"http://arxiv.org/pdf/{paper_id}"
+
+        # the rss times are in the format 'Mon, 24 Mar 2025 00:00:00 -0400'. Convert to datetime object
+        entry.published = datetime.strptime(entry.published, '%a, %d %b %Y %H:%M:%S %z')
+        
+        paper = {
+            'title': entry.title,
+            'authors': authors,
+            'published': entry.published,
+            'summary': entry.summary,
+            'type': entry.arxiv_announce_type,
+            'link': entry.link,
+            'pdf_link': pdf_link,
+            'journal_ref': entry.get('arxiv_journal_reference', 'None')
+        }
+        
+        papers.append(paper)
+    
+    return papers
+
 # ----------------------------------------------------------------------------
 # Helper Functions
 # ----------------------------------------------------------------------------
 def get_last_submission_date():
     """
-    Reads the last checked date from a file. If the file cannot be read,
-    defaults to 1 day ago. If the file doesn't exist, creates it with a date
-    set to 1 day ago.
+    Reads the last checked date from a file, unless overridden by command line argument.
     """
+    # use the date provided via command line if available.
+    if LAST_DATE_OVERRIDE is not None:
+        logging.info("Using override date provided via --lastdate argument")
+        return LAST_DATE_OVERRIDE
+    # otherwise read the date from the file
     if os.path.exists(LAST_SUBMISSION_FILE):
         try:
             with open(LAST_SUBMISSION_FILE, 'r') as f:
@@ -177,17 +234,23 @@ class ArxivBot(discord.Client):
 
                 # Extract authors from the result.
                 result_authors = [a.name for a in result.authors]
-                if not result_authors:
-                    logging.warning(f"No authors found for paper: '{result.title}'. Skipping.")
-                    continue
 
                 # Build a string with target authors and Discord tags.
                 target_authors_str = build_target_authors_string(result_authors, TARGET_AUTHORS, AUTHOR_DISCORD_IDS)
 
                 # Mark the paper as posted.
                 posted_papers.add(arxiv_id)
+
+                # Extract relevant information from the result.
                 title = result.title
                 link = result.entry_id  # Typically the paper URL
+                summary = result.summary
+                journal_ref = result.journal_ref
+
+                # if summary is too long, truncate it to 1000 characters
+                if len(summary) > 1400:
+                    summary = summary[:1400] + '[...]'
+
                 published_str = result.published.strftime('%Y-%m-%d %H:%M:%S')
                 logging.info(f"Found new paper: '{title}' by {target_authors_str}, submitted on {published_str}.")
 
@@ -200,11 +263,15 @@ class ArxivBot(discord.Client):
                     f"📄 **New paper by {target_authors_str}:**\n"
                     f"**Title:** {title}\n"
                     f"**Authors:** {', '.join(result_authors)}\n"
-                    f"**Published:** {published_str}\n"
+                    f"**Submitted:** {published_str}\n"
+                    f"**Abstract:** {summary}\n"
+                    f"{f'**Journal Reference:** {journal_ref}\n' if journal_ref else ''}"
                     f"🔗 <{link}>"
                 )
 
                 logging.info(f"Sending message for paper: '{title}' with target authors: {target_authors_str}.")
+                # print length of message to console
+                # logging.info(f"Message length: {len(message)}")
                 await channel.send(message)
                 papers_posted += 1
 
@@ -212,11 +279,12 @@ class ArxivBot(discord.Client):
 
             # Save the last submission date to the file, if any papers were posted.
             if papers_posted > 0:
-                # log last submission date found
                 logging.info(f"Last submission date found: {last_submission_date}")
-                # save last submission date PLUS ONE SECOND (to avoid duplicates)
-                # if you publish HALF A SECOND after the last submission but somehow end up in a different announcement, please reconsider your life choices
-                save_last_submission_time(last_submission_date + timedelta(seconds=1))
+                if NO_SAVE:
+                    logging.info("Skipping save of last submission date due to --nosave flag.")
+                else:
+                    save_last_submission_time(last_submission_date + timedelta(seconds=1))
+                    logging.info("Saved last submission date.")
 
         except Exception as e:
             logging.exception(f"Error during combined query processing: {e}")
@@ -252,7 +320,18 @@ async def main():
                 await bot.http._session.close()
 
 # ----------------------------------------------------------------------------
-# Entry Point
+# Entry Point and Command Line Argument Parsing
 # ----------------------------------------------------------------------------
+NO_SAVE = "--nosave" in sys.argv
+LAST_DATE_OVERRIDE = None
+for arg in sys.argv:
+    if arg.startswith("--lastdate="):
+        try:
+            date_str = arg.split("=", 1)[1]
+            LAST_DATE_OVERRIDE = datetime.fromisoformat(date_str)
+            logging.info(f"Overriding last submission date with: {date_str}")
+        except Exception as e:
+            logging.error(f"Invalid date format for --lastdate argument. Expected ISO format. Error: {e}")
+
 if __name__ == "__main__":
     asyncio.run(main())
