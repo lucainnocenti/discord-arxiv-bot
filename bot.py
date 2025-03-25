@@ -6,6 +6,7 @@ import sys                               # For system-specific parameters and fu
 import logging                           # For logging messages to both console and file
 import config                            # Module to import configuration data such as tokens and IDs
 from datetime import datetime, timedelta # For date and time handling
+from zoneinfo import ZoneInfo
 import feedparser                        # For parsing RSS feeds
 from typing import List, Dict, Any, Optional  # For type annotations
 from pylatexenc.latex2text import LatexNodes2Text
@@ -29,6 +30,7 @@ script_dir: str = os.path.dirname(os.path.abspath(__file__))
 log_path: str = os.path.join(script_dir, "bot.log")
 # Define the file that stores the last time arXiv was checked.
 LAST_SUBMISSION_FILE: str = os.path.join(script_dir, "last_submission_date.txt")
+LAST_RSS_CHECK_FILE: str = os.path.join(script_dir, "last_rss_check.txt")
 
 # ----------------------------------------------------------------------------
 # Logging Setup
@@ -113,7 +115,6 @@ def get_latest_papers_from_rss(category: str = "quant-ph", max_results: int = 10
             'announce_type': entry.arxiv_announce_type
         }
 
-        print('Huston, we have a paper:', paper)
         papers.append(paper)
     
     return papers
@@ -168,7 +169,11 @@ async def get_latest_papers_from_api(last_submission_date: datetime, category: s
     return papers
 
 
-async def fetch_latest_papers(last_submission_date: datetime, source: str, category: str = "quant-ph", max_results: int = 50) -> List[Dict[str, Any]]:
+async def fetch_latest_papers(
+    source: str,
+    category: str = "quant-ph",
+    max_results: int = 50
+) -> List[Dict[str, Any]]:
     """
     Fetches and normalizes papers from either the arXiv API or RSS feed based on the selected source.
     
@@ -188,31 +193,41 @@ async def fetch_latest_papers(last_submission_date: datetime, source: str, categ
     
     if source == "api":
         logging.info("Fetching papers using the arXiv API.")
+        if LAST_DATE_OVERRIDE is not None:
+            last_submission_date: datetime = LAST_DATE_OVERRIDE
+            logging.info("Using override date {LAST_DATE_OVERRIDE}.")
+        else:
+            last_submission_date: datetime = get_last_submission_date_from_file()
+            logging.info(f"Using date found in file: {last_submission_date}")
         papers = await get_latest_papers_from_api(last_submission_date, category, max_results)
     elif source == "rss":
         logging.info("Fetching papers using the arXiv RSS feed.")
+        already_checked_rss = already_checked_rss_today()
+        if already_checked_rss and not FORCE_RSS_CHECK:
+            logging.info("RSS feed was already checked today. Skipping.")
+            return []
+        if already_checked_rss and FORCE_RSS_CHECK:
+            logging.info("Forcing RSS check even though it was already checked today.")
+
         # Run the RSS fetching in an executor to avoid blocking.
         papers = await loop.run_in_executor(None, lambda: get_latest_papers_from_rss(category, max_results))
     else:
-        logging.error(f"Unknown source: {source}. Defaulting to API.")
-        papers = await get_latest_papers_from_api(last_submission_date, category, max_results)
+        raise ValueError("Invalid source specified. Valid options are 'api' and 'rss'.")
     
+    logging.info(f"Found {len(papers)} papers using source '{source}'.")
     return papers
 
 
-# ----------------------------------------------------------------------------
-# Helper Functions for Date Management and Author Formatting
-# ----------------------------------------------------------------------------
-def get_last_submission_date() -> datetime:
+
+def get_last_submission_date_from_file() -> datetime:
     """
-    Reads the last checked date from a file, unless overridden by a command-line argument.
+    Reads the last checked date from a file.
+    If the file doesn't exist or an error occurs, it's created with a default date (yesterday).
     
     Returns:
         The datetime representing the last time arXiv was checked.
     """
-    if LAST_DATE_OVERRIDE is not None:
-        logging.info("Using override date provided via --lastdate argument")
-        return LAST_DATE_OVERRIDE
+    
     if os.path.exists(LAST_SUBMISSION_FILE):
         try:
             with open(LAST_SUBMISSION_FILE, 'r') as f:
@@ -227,9 +242,9 @@ def get_last_submission_date() -> datetime:
             f.write(newdate.isoformat())
         return newdate
 
-def save_last_submission_time(time: datetime) -> None:
+def save_last_submission_time_to_file(time: datetime) -> None:
     """
-    Saves the provided datetime as the last check date into a file.
+    Saves the provided datetime as the last check date into LAST_SUBMISSION_FILE.
     
     Args:
         time: A datetime object to be saved.
@@ -240,6 +255,33 @@ def save_last_submission_time(time: datetime) -> None:
         logging.info(f"Saved date {time.isoformat()} to {LAST_SUBMISSION_FILE}")
     except Exception as e:
         logging.error(f"Error saving last check date: {e}")
+
+def already_checked_rss_today() -> bool:
+    """
+    Checks if the RSS feed was already checked today by comparing the current date with the one in LAST_RSS_CHECK_FILE.
+    If the file doesn't exist or an error occurs, it's created with the current date.
+    
+    Uses Eastern Time (ET) timezone for date comparison since arXiv RSS updates around midnight ET.
+    """
+    try:
+        
+        if os.path.exists(LAST_RSS_CHECK_FILE):
+            # Use explicit Eastern Time zone
+            current_date = datetime.now(ZoneInfo('America/New_York')).date()
+            with open(LAST_RSS_CHECK_FILE, 'r') as f:
+                date_str: str = f.read().strip()
+            last_check_date = datetime.fromisoformat(date_str).date()
+            return last_check_date == current_date
+        else:
+            # File doesn't exist, create it with current date
+            logging.info(f"Creating new file {LAST_RSS_CHECK_FILE} with current date.")
+            with open(LAST_RSS_CHECK_FILE, 'w') as f:
+                f.write(datetime.now(ZoneInfo('America/New_York')).isoformat())
+            return False
+    
+    except Exception as e:
+        logging.error(f"Error checking last RSS check date: {e}")
+        return False
 
 def build_target_authors_string(result_authors: List[str], target_authors: List[str], author_discord_ids: Dict[str, str]) -> str:
     """
@@ -289,10 +331,10 @@ class ArxivBot(discord.Client):
         It logs the identity, performs a one-time check for new arXiv papers, and then shuts down.
         """
         logging.info(f"Logged in as {self.user}")
-        await self.check_arxiv_once()
+        await self.check_arxiv()
         await self.close()  # Terminate after processing to prevent a long-running process
 
-    async def check_arxiv_once(self) -> None:
+    async def check_arxiv(self) -> None:
         """
         Checks for new arXiv papers, constructs messages with paper details, and posts them to a Discord channel.
         """
@@ -301,16 +343,10 @@ class ArxivBot(discord.Client):
         if channel is None:
             logging.error("ERROR: Could not get channel. Please check CHANNEL_ID!")
             return
-
-        logging.info(f"Posting to channel: {channel}")
-
-        # Retrieve the last submission date from storage or override.
-        last_submission_date: datetime = get_last_submission_date()
-        logging.info(f"Checking papers published since: {last_submission_date}")
+        logging.info(f"Connecting to the Discord channel: {channel}")
 
         # Fetch papers from the selected source (API or RSS)
-        papers: List[Dict[str, Any]] = await fetch_latest_papers(last_submission_date, SOURCE, category="quant-ph", max_results=50)
-        logging.info(f"Found {len(papers)} papers using source '{SOURCE}'.")
+        papers: List[Dict[str, Any]] = await fetch_latest_papers(source=SOURCE, category="quant-ph", max_results=50)
 
         papers_posted: int = 0
         for paper in papers:
@@ -331,10 +367,6 @@ class ArxivBot(discord.Client):
 
             published_str: str = paper['published'].strftime('%Y-%m-%d')
             logging.info(f"Found new paper: '{paper['title']}' by {target_authors_str}, submitted on {published_str}.")
-
-            # Update the last submission date if this paper is more recent (this is actually useless for the RSS; needed for the API though)
-            if paper['published'].replace(tzinfo=None) > last_submission_date:
-                last_submission_date = paper['published'].replace(tzinfo=None)
 
             # Precompute journal reference line if available.
             journal_line: str = f"**Journal Reference:** {paper['journal_ref']}\n" if paper.get('journal_ref') else ""
@@ -368,14 +400,24 @@ class ArxivBot(discord.Client):
         logging.info(f"Posted {papers_posted} new papers.")
 
         # Save the new last submission date if papers were posted (unless --nosave flag is active).
-        if papers_posted > 0:
-            logging.info(f"Last submission date found: {last_submission_date}")
+        if papers_posted > 0 and SOURCE == "api":
             if NO_SAVE:
                 logging.info("Skipping save of last submission date due to --nosave flag.")
             else:
+                # extract last submission date among the found papers
+                last_submission_date = max(paper['published'].replace(tzinfo=None) for paper in papers)
+                logging.info(f"Last submission date found: {last_submission_date}")
                 # Add a small delta to avoid reprocessing the same paper.
-                save_last_submission_time(last_submission_date + timedelta(seconds=1))
+                save_last_submission_time_to_file(last_submission_date + timedelta(seconds=1))
                 logging.info("Saved last submission date.")
+        elif SOURCE == "rss":
+            if NO_SAVE:
+                logging.info("Skipping save of last RSS check date due to --nosave flag.")
+            else:
+                # Save the current date as the last RSS check date.
+                with open(LAST_RSS_CHECK_FILE, 'w') as f:
+                    f.write(datetime.now(ZoneInfo('America/New_York')).isoformat())
+                logging.info("Saved last RSS check date.")
 
 # ----------------------------------------------------------------------------
 # Main Async Function to Start the Bot
@@ -417,6 +459,7 @@ NO_SAVE: bool = "--nosave" in sys.argv
 NO_SEND: bool = "--nosend" in sys.argv
 LAST_DATE_OVERRIDE: Optional[datetime] = None
 SOURCE: str = "rss"  # Default source is the arXiv API
+FORCE_RSS_CHECK: bool = "--forcerss" in sys.argv
 
 # Parse command-line arguments for date override and source selection.
 for arg in sys.argv:
@@ -437,6 +480,9 @@ for arg in sys.argv:
 
 if SOURCE == "rss" and LAST_DATE_OVERRIDE is not None:
     raise ValueError("Custom lastdate is not allowed when source is 'rss' as they are not compatible.")
+
+if SOURCE == "api" and FORCE_RSS_CHECK:
+    raise ValueError("The --forcerss flag is not allowed with the 'api' source as it is only relevant for the RSS feed.")
 
 if __name__ == "__main__":
     asyncio.run(main())
