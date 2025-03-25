@@ -8,6 +8,7 @@ import config                            # Module to import configuration data s
 from datetime import datetime, timedelta # For date and time handling
 from zoneinfo import ZoneInfo
 import feedparser                        # For parsing RSS feeds
+import typing
 from typing import List, Dict, Any, Optional  # For type annotations
 from pylatexenc.latex2text import LatexNodes2Text
 
@@ -51,7 +52,7 @@ logging.basicConfig(
 DISCORD_TOKEN: str = config.DISCORD_TOKEN   # Bot's Discord authentication token
 CHANNEL_ID: int = config.CHANNEL_ID         # Channel ID where messages are sent
 TARGET_AUTHORS: List[str] = config.TARGET_AUTHORS  # List of target authors
-AUTHOR_DISCORD_IDS: Dict[str, str] = config.AUTHOR_DISCORD_IDS  # Mapping from author names to their Discord user IDs
+AUTHOR_DISCORD_IDS: Dict[str, int] = config.AUTHOR_DISCORD_IDS  # Mapping from author names to their Discord user IDs
 
 # Global set to track posted papers during runtime (using paper IDs)
 posted_papers: set = set()
@@ -78,10 +79,18 @@ def get_latest_papers_from_rss(category: str = "quant-ph", max_results: int = 10
     
     for entry in feed.entries[:max_results]:
         # Extract authors from the RSS entry; each author is a dictionary.
-        # authors: List[str] = entry['authors'][0]['name'].split(', ')
+
+        # this bullshit here is to stop Pylance from complaining about the type of entry.authors
+        authors_list = entry.get('authors', [])
+        if not isinstance(authors_list, list) or len(authors_list) == 0:
+            raise ValueError(f"Invalid authors list for entry {entry.id}")
+        namevalue = authors_list[0].get('name', None)
+        if not isinstance(namevalue, str):
+            raise ValueError(f"Invalid author name for entry {entry.id}")
+
         authors: List[str] = [
             decode_author_name(author)
-            for author in entry['authors'][0]['name'].split(', ')
+            for author in namevalue.split(', ')
         ]
         
         # Only include the paper if at least one author matches one of the TARGET_AUTHORS (case-insensitive).
@@ -89,18 +98,18 @@ def get_latest_papers_from_rss(category: str = "quant-ph", max_results: int = 10
             continue
         
         # Build the PDF link using the paper ID extracted from the entry URL.
-        paper_id: str = entry.id.split('/abs/')[-1]
+        paper_id: str = typing.cast(str, entry.id).split('/abs/')[-1]
         pdf_link: str = f"http://arxiv.org/pdf/{paper_id}"
         
         # Parse the published date from the RSS feed (should just be midnight eastern US time).
         try:
-            published_dt: datetime = datetime.strptime(entry.published, '%a, %d %b %Y %H:%M:%S %z')
+            published_dt: datetime = datetime.strptime(typing.cast(str, entry.published), '%a, %d %b %Y %H:%M:%S %z')
         except Exception as e:
             logging.error(f"Error parsing date for entry {entry.id}: {e}")
             continue  # Skip entries with parsing errors
 
         # the entry.summary returned by the RSS includes a bunch of info BEFORE the actual abstract (which starts after the string "Abstract: "). Remove it.
-        summary = entry.summary.split("Abstract: ")[1]
+        summary = typing.cast(str, entry.summary).split("Abstract: ")[1]
 
         # Create a normalized paper dictionary.
         paper: Dict[str, Any] = {
@@ -283,7 +292,7 @@ def already_checked_rss_today() -> bool:
         logging.error(f"Error checking last RSS check date: {e}")
         return False
 
-def build_target_authors_string(result_authors: List[str], target_authors: List[str], author_discord_ids: Dict[str, str]) -> str:
+def build_target_authors_string(result_authors: List[str], target_authors: List[str], author_discord_ids: Dict[str, int]) -> str:
     """
     Constructs a human-friendly string tagging target authors (using Discord IDs when available).
     
@@ -339,8 +348,8 @@ class ArxivBot(discord.Client):
         Checks for new arXiv papers, constructs messages with paper details, and posts them to a Discord channel.
         """
         await self.wait_until_ready()
-        channel: Optional[discord.abc.Messageable] = self.get_channel(CHANNEL_ID)
-        if channel is None:
+        channel = self.get_channel(CHANNEL_ID)
+        if not isinstance(channel, discord.TextChannel):
             logging.error("ERROR: Could not get channel. Please check CHANNEL_ID!")
             return
         logging.info(f"Connecting to the Discord channel: {channel}")
@@ -436,21 +445,7 @@ async def main() -> None:
         if not bot.is_closed():
             logging.info("Closing bot connection...")
             await bot.close()
-        # Cancel any remaining pending tasks.
-        pending = asyncio.all_tasks(asyncio.get_event_loop())
-        for task in pending:
-            if task is not asyncio.current_task():
-                try:
-                    logging.info("Cancelling pending task...")
-                    task.cancel()
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        # For Discord.py 2.0+ ensure the aiohttp session is closed.
-        if hasattr(bot, 'http') and hasattr(bot.http, '_session'):
-            if not bot.http._session.closed:
-                logging.info("Closing aiohttp session...")
-                await bot.http._session.close()
+
 
 # ----------------------------------------------------------------------------
 # Entry Point and Command Line Argument Parsing
