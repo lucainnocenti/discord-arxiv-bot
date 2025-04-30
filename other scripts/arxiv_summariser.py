@@ -10,7 +10,7 @@ def fetch_arxiv_quant_ph():
     """
     # Define time window: now and 24 hours ago (in UTC)
     now = datetime.datetime.now(datetime.timezone.utc)
-    yesterday = now - datetime.timedelta(days=1)
+    yesterday = now - datetime.timedelta(days=2)
     
     # Query parameters: search for category quant-ph, sorted by submission date (descending)
     url = ("http://export.arxiv.org/api/query?"
