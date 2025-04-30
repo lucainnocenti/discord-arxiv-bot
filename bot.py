@@ -51,6 +51,7 @@ logging.basicConfig(
 # ----------------------------------------------------------------------------
 DISCORD_TOKEN: str = config.DISCORD_TOKEN   # Bot's Discord authentication token
 CHANNEL_ID: int = config.CHANNEL_ID         # Channel ID where messages are sent
+TEST_CHANNEL_ID: int = config.TEST_CHANNEL_ID         # Channel ID where messages are sent
 TARGET_AUTHORS: List[str] = config.TARGET_AUTHORS  # List of target authors
 AUTHOR_DISCORD_IDS: Dict[str, int] = config.AUTHOR_DISCORD_IDS  # Mapping from author names to their Discord user IDs
 
@@ -348,7 +349,10 @@ class ArxivBot(discord.Client):
         Checks for new arXiv papers, constructs messages with paper details, and posts them to a Discord channel.
         """
         await self.wait_until_ready()
-        channel = self.get_channel(CHANNEL_ID)
+        if USETESTCHANNEL:
+            channel = self.get_channel(TEST_CHANNEL_ID)
+        else:
+            channel = self.get_channel(CHANNEL_ID)
         if not isinstance(channel, discord.TextChannel):
             logging.error("ERROR: Could not get channel. Please check CHANNEL_ID!")
             return
@@ -374,7 +378,8 @@ class ArxivBot(discord.Client):
             if len(summary) > 1400:
                 summary = summary[:1400] + '...[continue]'
 
-            published_str: str = paper['published'].strftime('%Y-%m-%d')
+            published_str: str = (paper['published'] - timedelta(days=1)).strftime('%Y-%m-%d')
+            
             logging.info(f"Found new paper: '{paper['title']}' by {target_authors_str}, submitted on {published_str}.")
 
             # Precompute journal reference line if available.
@@ -398,6 +403,23 @@ class ArxivBot(discord.Client):
                     f"{journal_line}"
                     f"🔗 <{paper['link']}>"
                 )
+                # if the message is too long, try to only print the first author and the rest as "et al."
+                if len(message) > 2000:
+                    first_author: str = paper['authors'][0]
+                    message = (
+                        f"📄 **New paper by {target_authors_str}:**\n"
+                        f"**Title:** {paper['title']}\n"
+                        f"**Authors:** {first_author} et al.\n"
+                        f"**Submitted:** {published_str}\n"
+                        f"**Abstract:** {summary}\n"
+                        f"{journal_line}"
+                        f"🔗 <{paper['link']}>"
+                    )
+
+                    # if the message is still too long, throw an error and skip posting it
+                    if len(message) > 2000:
+                        logging.error(f"Message too long for paper '{paper['title']}'. Skipping.")
+                        continue
             
             if NO_SEND:
                 logging.info(f"Skipping Discord message for paper: {paper['title']}")
@@ -455,6 +477,7 @@ NO_SEND: bool = "--nosend" in sys.argv
 LAST_DATE_OVERRIDE: Optional[datetime] = None
 SOURCE: str = "rss"  # Default source is the arXiv API
 FORCE_RSS_CHECK: bool = "--forcerss" in sys.argv
+USETESTCHANNEL: bool = "--testchannel" in sys.argv
 
 # Parse command-line arguments for date override and source selection.
 for arg in sys.argv:
