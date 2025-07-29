@@ -183,8 +183,7 @@ class ArxivFetcher:
             return [] # Return empty list on error
 
         papers: List[Paper] = []
-        # Process up to max_results entries from the feed
-        for entry in feed.entries[:self.settings.max_results]:
+        for entry in feed.entries:
             try:
                 # Attempt to normalize the raw RSS entry into our Paper structure
                 paper = self._normalize_rss_entry(entry)

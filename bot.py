@@ -54,6 +54,7 @@ class ArxivBotClient(discord.Client):
         """The main logic: fetch, filter, format, and post."""
         await self.wait_until_ready() # Ensure internal cache is ready
 
+        # determine whether to use test channel or production channel
         target_channel_id = self.settings.test_channel_id if self.settings.use_test_channel else self.settings.channel_id
         channel = self.get_channel(target_channel_id)
 
@@ -73,6 +74,7 @@ class ArxivBotClient(discord.Client):
             try:
                 # Pass the relevant date only if using API source
                 papers_to_post = await self.fetcher.fetch_latest_papers(last_api_check_time)
+                # print(papers_to_post)  # Debugging line to see fetched papers
             except Exception as e:
                  self.logger.exception(f"Failed to fetch papers: {e}")
                  papers_to_post = [] # Ensure it's an empty list on fetch failure
@@ -154,7 +156,7 @@ class ArxivBotClient(discord.Client):
 async def run_bot():
     """Loads settings, sets up components, and starts the bot."""
     try:
-        settings = load_settings()
+        settings = load_settings() # parse command line arguments and store in settings
         setup_logging(settings.log_path) # Setup logging early
         logging.info("Configuration loaded successfully.")
         logging.info(f"Running with source: {settings.source}, Test Channel: {settings.use_test_channel}, No Save: {settings.no_save}, No Send: {settings.no_send}")

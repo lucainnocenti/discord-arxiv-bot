@@ -11,7 +11,7 @@ import config  # Your existing config file
 
 # --- Constants ---
 DEFAULT_CATEGORY = "quant-ph"
-DEFAULT_MAX_RESULTS = 50
+DEFAULT_MAX_RESULTS = 1000
 DEFAULT_SOURCE = "rss"
 API_SOURCE = "api"
 RSS_SOURCE = "rss"
