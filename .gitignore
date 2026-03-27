@@ -7,3 +7,6 @@ config.py
 script.sh
 bot.log
 last_submission_date.txt
+last_rss_check.txt
+posted_papers.txt
+playground.ipynb

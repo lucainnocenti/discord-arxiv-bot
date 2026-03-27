@@ -7,8 +7,13 @@ supporting both the official API and the RSS feed.
 import asyncio
 import arxiv # Library for interacting with the arXiv API
 import feedparser # Library for parsing RSS/Atom feeds
+import json
 import logging
+import re
+import urllib.parse
+import urllib.request
 from datetime import datetime
+from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo # For timezone handling (especially UTC and ET)
 import time # Needed for type hinting time.struct_time from feedparser
 from typing import List, Dict, Any, NamedTuple, Optional, cast, Tuple # For type hinting
@@ -21,15 +26,36 @@ from utils import decode_author_name
 # Using NamedTuple provides immutability and dot-notation access.
 class Paper(NamedTuple):
     """Represents a normalized arXiv paper with key details."""
-    id: str              # Unique identifier (usually the arXiv URL: http://arxiv.org/abs/...)
+    id: str              # Canonical arXiv identifier (for example, '2503.16215')
     title: str           # Paper title
     authors: List[str]   # List of author names
     published: datetime  # Published/Announced datetime (timezone-aware)
     summary: str         # Paper abstract/summary
     link: str            # Link to the abstract page (same as id)
     pdf_link: str        # Direct link to the PDF
+    doi: Optional[str]   # DOI, if available
     journal_ref: Optional[str] # Journal reference, if available (e.g., "Phys. Rev. Lett. ...")
     announce_type: Optional[str] # Type of announcement from RSS (e.g., 'new', 'replace'), or 'api_new' for API results
+
+
+ARXIV_ID_PATTERN = re.compile(r'(\d{4}\.\d{4,5})(v\d+)?')
+TITLE_NORMALIZATION_PATTERN = re.compile(r'[^a-z0-9]+')
+CROSSREF_API_URL = "https://api.crossref.org/works"
+
+
+def canonicalize_paper_id(raw_id: str) -> str:
+    """Converts arXiv URLs and OAI identifiers to a stable arXiv ID without the version suffix."""
+    normalized = raw_id.strip()
+    match = ARXIV_ID_PATTERN.search(normalized)
+    if match:
+        return match.group(1)
+
+    if '/abs/' in normalized:
+        normalized = normalized.split('/abs/', 1)[-1]
+    elif normalized.lower().startswith('oai:arxiv.org:'):
+        normalized = normalized.split(':', 2)[-1]
+
+    return normalized.removeprefix('abs/').split('v', 1)[0]
 
 class ArxivFetcher:
     """
@@ -88,6 +114,37 @@ class ArxivFetcher:
         self.logger.info(f"Found {len(papers)} papers matching criteria using source '{self.settings.source}'.")
         return papers
 
+    async def fetch_publication_updates(self, tracked_paper_ids: List[str]) -> List[Paper]:
+        """
+        Refreshes tracked arXiv papers and returns the ones that now look published.
+
+        arXiv metadata is treated as the primary source of truth because a DOI or
+        journal reference appearing there is the clearest signal that the authors
+        have linked the preprint to its journal publication. Crossref is used as a
+        conservative fallback when arXiv metadata has not been updated yet.
+        """
+        if not tracked_paper_ids:
+            return []
+
+        tracked_papers = await self._fetch_papers_by_ids(tracked_paper_ids)
+        publication_updates: List[Paper] = []
+        loop = asyncio.get_event_loop()
+
+        for paper in tracked_papers:
+            # If arXiv itself already exposes publication metadata, prefer that
+            # over any external inference.
+            if paper.journal_ref or paper.doi:
+                publication_updates.append(paper._replace(announce_type='published_metadata'))
+                continue
+
+            # Crossref is only consulted for papers that still look unpublished
+            # on arXiv, which helps keep false positives low.
+            crossref_match = await loop.run_in_executor(None, self._find_crossref_publication, paper)
+            if crossref_match:
+                publication_updates.append(crossref_match)
+
+        return publication_updates
+
     async def _fetch_from_api(self, last_submission_date: datetime) -> List[Paper]:
         """
         Fetches papers using the arXiv API, filtering by category, target authors, and submission date.
@@ -98,45 +155,163 @@ class ArxivFetcher:
         Returns:
             A list of normalized Paper objects fetched from the API. Returns empty list on API error.
         """
-        # Construct the author part of the query (match any of the target authors)
-        authors_query = ' OR '.join(f'au:"{author}"' for author in self.settings.target_authors)
-
         # Format the date for the arXiv API query (YYYYMMDDHHMMSS format, assumed UTC)
         # The `last_submission_date` passed in should ideally be timezone-naive or UTC
         # for consistent comparison with arXiv's submittedDate field.
         date_query_str = last_submission_date.strftime("%Y%m%d%H%M%S")
 
-        # Combine category, authors, and date into the final query string
-        query = (
-            f'cat:{self.settings.category} AND '
-            f'({authors_query}) AND '
-            f'submittedDate:[{date_query_str} TO 99999999]' # Papers submitted from last_date onwards
-        )
-        self.logger.info(f"Constructed API query: {query}")
+        all_authors = self.settings.target_authors
+        filtered_authors: List[str] = []
+        seen_filtered = set()
+        for author in all_authors:
+            parts = author.split()
+            if len(parts) < 2:
+                continue
+            first_part = parts[0]
+            if len(first_part) <= 1 or first_part.endswith('.'):
+                continue
+            if author in seen_filtered:
+                continue
+            seen_filtered.add(author)
+            filtered_authors.append(author)
 
-        # Create the search object with sorting preferences
-        search = arxiv.Search(
-            query=query,
-            max_results=self.settings.max_results,
-            sort_by=arxiv.SortCriterion.SubmittedDate, # Sort by submission date
-            sort_order=arxiv.SortOrder.Ascending,     # Get oldest matching first (usually desired)
-        )
+        authors = filtered_authors if filtered_authors else all_authors
+        if len(authors) != len(all_authors):
+            self.logger.info(
+                f"Using {len(authors)} canonical author names for API query "
+                f"(filtered from {len(all_authors)} configured names)."
+            )
 
-        try:
-            # Get the current event loop
-            loop = asyncio.get_event_loop()
-            # The arxiv library's search is blocking, run it in an executor thread
-            results_iterator = self.arxiv_client.results(search)
-            results = await loop.run_in_executor(None, list, results_iterator) # Convert iterator to list
-            self.logger.info(f"arXiv API returned {len(results)} results.")
-        except Exception as e:
-            # Log errors during the API call
-            self.logger.error(f"Error during arXiv API search: {e}", exc_info=True)
-            return [] # Return an empty list if the API call fails
+        if not authors:
+            author_chunks: List[List[str]] = [[]]
+        else:
+            max_authors_per_query = 20
+            author_chunks = [
+                authors[i:i + max_authors_per_query]
+                for i in range(0, len(authors), max_authors_per_query)
+            ]
+
+        loop = asyncio.get_event_loop()
+        unique_results: List[arxiv.Result] = []
+        seen_entry_ids = set()
+
+        for index, author_chunk in enumerate(author_chunks, start=1):
+            if author_chunk:
+                authors_query = ' OR '.join(f'au:"{author}"' for author in author_chunk)
+                query = (
+                    f'cat:{self.settings.category} AND '
+                    f'({authors_query}) AND '
+                    f'submittedDate:[{date_query_str} TO 99991231235959]'
+                )
+            else:
+                query = (
+                    f'cat:{self.settings.category} AND '
+                    f'submittedDate:[{date_query_str} TO 99991231235959]'
+                )
+
+            self.logger.info(
+                f"Constructed API query chunk {index}/{len(author_chunks)} with "
+                f"{len(author_chunk)} authors."
+            )
+
+            search = arxiv.Search(
+                query=query,
+                max_results=self.settings.max_results,
+                sort_by=arxiv.SortCriterion.SubmittedDate,
+                sort_order=arxiv.SortOrder.Ascending,
+            )
+
+            chunk_results: List[arxiv.Result] = []
+            for attempt in range(1, 3):
+                try:
+                    results_iterator = self.arxiv_client.results(search)
+                    chunk_results = await loop.run_in_executor(None, list, results_iterator)
+                    self.logger.info(
+                        f"arXiv API chunk {index}/{len(author_chunks)} returned {len(chunk_results)} results."
+                    )
+                    break
+                except Exception as e:
+                    is_rate_limited = "HTTP 429" in str(e)
+                    is_last_attempt = attempt == 2
+
+                    if is_rate_limited and not is_last_attempt:
+                        self.logger.warning(
+                            f"Rate-limited on chunk {index}/{len(author_chunks)} (attempt {attempt}). "
+                            f"Waiting before retry."
+                        )
+                        await asyncio.sleep(10)
+                        continue
+
+                    self.logger.error(
+                        f"Error during arXiv API search for chunk {index}/{len(author_chunks)}: {e}",
+                        exc_info=True,
+                    )
+                    break
+
+            for result in chunk_results:
+                if result.entry_id in seen_entry_ids:
+                    continue
+                seen_entry_ids.add(result.entry_id)
+                unique_results.append(result)
+
+            if index < len(author_chunks):
+                await asyncio.sleep(3)
+
+        unique_results.sort(key=lambda r: r.published)
 
         # Normalize each result from the API into our standard Paper format
-        normalized_papers = [self._normalize_api_result(result) for result in results]
+        normalized_papers = [self._normalize_api_result(result) for result in unique_results]
         return normalized_papers
+
+    async def _fetch_papers_by_ids(self, paper_ids: List[str]) -> List[Paper]:
+        """Fetches specific arXiv papers by ID to refresh their metadata."""
+        normalized_ids: List[str] = []
+        seen_ids = set()
+        for paper_id in paper_ids:
+            canonical_id = canonicalize_paper_id(paper_id)
+            if canonical_id in seen_ids:
+                continue
+            seen_ids.add(canonical_id)
+            normalized_ids.append(canonical_id)
+
+        if not normalized_ids:
+            return []
+
+        loop = asyncio.get_event_loop()
+        # Rebuild results in the original order later so the caller gets stable,
+        # predictable processing independent of API response order.
+        papers_by_id: Dict[str, Paper] = {}
+        chunk_size = 50
+        id_chunks = [
+            normalized_ids[i:i + chunk_size]
+            for i in range(0, len(normalized_ids), chunk_size)
+        ]
+
+        for index, id_chunk in enumerate(id_chunks, start=1):
+            self.logger.info(
+                f"Refreshing publication metadata for chunk {index}/{len(id_chunks)} "
+                f"({len(id_chunk)} tracked papers)."
+            )
+            search = arxiv.Search(id_list=id_chunk, max_results=len(id_chunk))
+
+            try:
+                results_iterator = self.arxiv_client.results(search)
+                chunk_results = await loop.run_in_executor(None, list, results_iterator)
+            except Exception as e:
+                self.logger.error(
+                    f"Error refreshing tracked paper metadata for chunk {index}/{len(id_chunks)}: {e}",
+                    exc_info=True,
+                )
+                continue
+
+            for result in chunk_results:
+                paper = self._normalize_api_result(result)
+                papers_by_id[paper.id] = paper
+
+            if index < len(id_chunks):
+                await asyncio.sleep(3)
+
+        return [papers_by_id[paper_id] for paper_id in normalized_ids if paper_id in papers_by_id]
 
     def _fetch_from_rss(self) -> List[Paper]:
         """
@@ -243,13 +418,14 @@ class ArxivFetcher:
 
         # Create and return the Paper object
         return Paper(
-            id=entry_id_url, # Use the abstract URL as the unique ID
+            id=canonicalize_paper_id(entry_id_url),
             title=result.title.strip(), # Clean title whitespace
             authors=[author.name for author in result.authors], # Extract author names
             published=published_dt, # Use the timezone-aware datetime
             summary=summary_cleaned,
             link=entry_id_url, # Link is the same as the ID (abstract URL)
             pdf_link=pdf_link,
+            doi=result.doi, # DOI may be present for journal-published works
             journal_ref=result.journal_ref, # May be None if not available
             announce_type='api_new' # Mark source as API; API doesn't distinguish announce types
         )
@@ -370,22 +546,144 @@ class ArxivFetcher:
 
         # --- Get Optional Fields Safely ---
         journal_ref = getattr(entry, 'arxiv_journal_reference', None) # Standard key in arXiv RSS for journal ref
+        doi = getattr(entry, 'arxiv_doi', None) # Standard key in arXiv RSS for DOI, when available
         announce_type = getattr(entry, 'arxiv_announce_type', 'rss_unknown') # Key for 'new', 'replace', etc.
 
         # Ensure optional fields are strings or None (handle potential non-string types gracefully)
         if journal_ref is not None and not isinstance(journal_ref, str): journal_ref = str(journal_ref)
+        if doi is not None and not isinstance(doi, str): doi = str(doi)
         if announce_type is not None and not isinstance(announce_type, str): announce_type = str(announce_type)
 
         # --- Final Assembly into Paper Object ---
         # All required fields have been validated or have fallbacks by this point.
         return Paper(
-            id=entry_id_url,        # Validated string
+            id=canonicalize_paper_id(entry_id_url),
             title=title.strip(),    # Validated string, clean whitespace
             authors=authors,        # List[str] (might be empty if parsing failed)
             published=published_dt, # Validated timezone-aware datetime
             summary=summary,        # Cleaned string
             link=link,              # Validated string
             pdf_link=pdf_link,      # Constructed string
+            doi=doi,                # Optional[str]
             journal_ref=journal_ref, # Optional[str]
             announce_type=announce_type # Optional[str]
         )
+
+    def _find_crossref_publication(self, paper: Paper) -> Optional[Paper]:
+        """Queries Crossref for a likely journal-article match when arXiv metadata is incomplete."""
+        if not paper.title or not paper.authors:
+            return None
+
+        # Keep the query narrow: same title, same first author, journal articles
+        # only, and just the fields needed for the publication-update decision.
+        params = {
+            "rows": "5",
+            "query.title": paper.title,
+            "query.author": paper.authors[0],
+            "filter": "type:journal-article",
+            "select": "DOI,title,author,container-title,type",
+        }
+        if self.settings.crossref_mailto:
+            params["mailto"] = self.settings.crossref_mailto
+
+        request = urllib.request.Request(
+            f"{CROSSREF_API_URL}?{urllib.parse.urlencode(params)}",
+            headers={"User-Agent": self._crossref_user_agent()},
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = json.load(response)
+        except Exception as e:
+            self.logger.warning(f"Crossref lookup failed for {paper.id}: {e}")
+            return None
+
+        items = payload.get("message", {}).get("items", [])
+        if not isinstance(items, list):
+            return None
+
+        for item in items:
+            candidate = self._crossref_item_to_publication_update(paper, item)
+            if candidate:
+                self.logger.info(f"Crossref matched tracked paper {paper.id} to DOI {candidate.doi}.")
+                return candidate
+
+        return None
+
+    def _crossref_item_to_publication_update(self, paper: Paper, item: Dict[str, Any]) -> Optional[Paper]:
+        """Validates a Crossref record and converts it into a publication update."""
+        if item.get("type") != "journal-article":
+            return None
+
+        doi = item.get("DOI")
+        titles = item.get("title", [])
+        authors = item.get("author", [])
+        if not isinstance(doi, str) or not titles:
+            return None
+
+        crossref_title = titles[0] if isinstance(titles[0], str) else ""
+        if not crossref_title or not self._is_probable_crossref_match(paper, crossref_title, authors):
+            return None
+
+        container_titles = item.get("container-title", [])
+        journal_ref = None
+        if isinstance(container_titles, list) and container_titles:
+            first_container_title = container_titles[0]
+            if isinstance(first_container_title, str) and first_container_title.strip():
+                journal_ref = first_container_title.strip()
+
+        return paper._replace(
+            doi=doi,
+            journal_ref=paper.journal_ref or journal_ref,
+            announce_type='crossref_published',
+        )
+
+    def _is_probable_crossref_match(
+        self,
+        paper: Paper,
+        crossref_title: str,
+        crossref_authors: Any,
+    ) -> bool:
+        """Uses a conservative title+author check to avoid false-positive DOI matches."""
+        # Publication updates are much noisier than new-paper detection, so this
+        # intentionally errs on the side of missing a match rather than claiming
+        # the wrong DOI for a tracked preprint.
+        paper_title = self._normalize_title_for_match(paper.title)
+        candidate_title = self._normalize_title_for_match(crossref_title)
+        if not paper_title or not candidate_title:
+            return False
+
+        title_similarity = SequenceMatcher(None, paper_title, candidate_title).ratio()
+        if title_similarity < 0.93 and paper_title != candidate_title:
+            return False
+
+        first_author_family = self._extract_family_name(paper.authors[0])
+        if not first_author_family:
+            return False
+
+        candidate_families = set()
+        if isinstance(crossref_authors, list):
+            for author in crossref_authors:
+                if not isinstance(author, dict):
+                    continue
+                family_name = author.get("family")
+                full_name = author.get("name")
+                if isinstance(family_name, str):
+                    candidate_families.add(self._extract_family_name(family_name))
+                elif isinstance(full_name, str):
+                    candidate_families.add(self._extract_family_name(full_name))
+
+        return first_author_family in candidate_families
+
+    def _crossref_user_agent(self) -> str:
+        """Builds a polite Crossref User-Agent string."""
+        if self.settings.crossref_mailto:
+            return f"arxiv-discord-bot/1.0 (mailto:{self.settings.crossref_mailto})"
+        return "arxiv-discord-bot/1.0"
+
+    def _normalize_title_for_match(self, title: str) -> str:
+        return TITLE_NORMALIZATION_PATTERN.sub('', title.casefold())
+
+    def _extract_family_name(self, author_name: str) -> str:
+        tokens = TITLE_NORMALIZATION_PATTERN.sub(' ', author_name.casefold()).split()
+        return tokens[-1] if tokens else ""

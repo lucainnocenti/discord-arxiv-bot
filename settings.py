@@ -27,12 +27,14 @@ class AppSettings:
     test_channel_id: int
     target_authors: List[str]
     author_discord_ids: Dict[str, int]
+    crossref_mailto: Optional[str] = None
 
     # File Paths (consider making these configurable too)
     script_dir: str = field(default_factory=lambda: os.path.dirname(os.path.abspath(__file__)))
     log_path: str = field(init=False)
     last_submission_file: str = field(init=False)
     last_rss_check_file: str = field(init=False)
+    posted_papers_file: str = field(init=False)
 
     # Runtime Flags from CLI
     no_save: bool = False
@@ -51,6 +53,7 @@ class AppSettings:
         self.log_path = os.path.join(self.script_dir, "bot.log")
         self.last_submission_file = os.path.join(self.script_dir, "last_submission_date.txt")
         self.last_rss_check_file = os.path.join(self.script_dir, "last_rss_check.txt")
+        self.posted_papers_file = os.path.join(self.script_dir, "posted_papers.txt")
 
         # Validation
         if self.source not in SOURCES:
@@ -93,6 +96,9 @@ def load_settings() -> AppSettings:
         test_channel_id=config.TEST_CHANNEL_ID,
         target_authors=config.TARGET_AUTHORS,
         author_discord_ids=config.AUTHOR_DISCORD_IDS,
+        # Crossref recommends including contact info in API requests so they can
+        # reach the maintainer if the bot causes issues or needs coordination.
+        crossref_mailto=os.getenv("CROSSREF_MAILTO", getattr(config, "CROSSREF_MAILTO", None)),
         no_save=args.nosave,
         no_send=args.nosend,
         last_date_override=last_date_override,

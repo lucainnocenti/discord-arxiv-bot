@@ -4,25 +4,31 @@ import asyncio
 import logging
 import sys
 from datetime import datetime
-from typing import Set, Optional
+from typing import Dict, Optional, Set
 
 # Import the structured components
 from settings import load_settings, AppSettings, API_SOURCE, RSS_SOURCE
-from state_manager import StateManager
+from state_manager import PaperRecord, StateManager
 from arxiv_fetcher import ArxivFetcher, Paper
 from discord_formatter import format_paper_message
 
 def setup_logging(log_path: str):
     """Configures logging to file and console."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=[
-            logging.FileHandler(log_path),
-            logging.StreamHandler(sys.stdout)
-        ]
+    fmt = logging.Formatter(
+        '%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
     )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # Remove any handlers that libraries (e.g. arxiv, feedparser) may have
+    # added before this function runs — basicConfig() would be a no-op otherwise.
+    root.handlers.clear()
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    root.addHandler(fh)
+    root.addHandler(sh)
     # Silence overly verbose libraries if needed
     logging.getLogger("discord").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
@@ -35,8 +41,12 @@ class ArxivBotClient(discord.Client):
         self.settings = settings
         self.state_manager = state_manager
         self.fetcher = fetcher
-        # Runtime set to track posted papers *within this run* - useful for RSS duplicates
+        # The registry is the bot's durable memory: whether a paper was already
+        # announced as a preprint, and whether its later journal publication was
+        # already announced too.
+        self.paper_registry: Dict[str, PaperRecord] = self.state_manager.get_paper_registry()
         self.posted_in_this_run: Set[str] = set()
+        self.publication_updates_in_this_run: Set[str] = set()
         self.logger = logging.getLogger(self.__class__.__name__) # Specific logger
 
     async def on_ready(self):
@@ -51,7 +61,7 @@ class ArxivBotClient(discord.Client):
             await self.close()
 
     async def check_and_post_papers(self):
-        """The main logic: fetch, filter, format, and post."""
+        """The main logic: fetch, filter, format, post, then check for publication updates."""
         await self.wait_until_ready() # Ensure internal cache is ready
 
         # determine whether to use test channel or production channel
@@ -66,7 +76,8 @@ class ArxivBotClient(discord.Client):
         # --- Fetching ---
         last_api_check_time = self.state_manager.get_last_api_check_time()
 
-        # Conditional RSS check based on date
+        # RSS is polled at most once per day because the feed is a rolling window.
+        # API mode instead uses the last-submission timestamp as its incremental cursor.
         if self.settings.source == RSS_SOURCE and self.state_manager.has_checked_rss_today():
              self.logger.info("RSS source selected, but already checked today. No fetch needed.")
              papers_to_post = []
@@ -79,67 +90,58 @@ class ArxivBotClient(discord.Client):
                  self.logger.exception(f"Failed to fetch papers: {e}")
                  papers_to_post = [] # Ensure it's an empty list on fetch failure
 
-        if not papers_to_post:
-            self.logger.info("No new papers found matching criteria.")
-            # Still need to potentially update RSS check time even if no papers found
-            if self.settings.source == RSS_SOURCE and not self.settings.force_rss_check:
-                 # Save RSS check time if we performed a check (i.e., didn't skip)
-                 self.state_manager.save_rss_check_time()
-            return
-
         # --- Processing and Posting ---
+        # This first loop handles brand-new preprints only. Publication updates
+        # for already-known papers are handled in a second pass below.
         papers_posted_count = 0
+        publication_updates_count = 0
         latest_paper_time: Optional[datetime] = None # Keep track for saving API state
 
         for paper in papers_to_post:
-            # Use paper.id which should be the unique arXiv identifier (e.g., 'http://arxiv.org/abs/...')
             if paper.id in self.posted_in_this_run:
                 self.logger.info(f"Paper {paper.id} already processed in this run, skipping.")
+                continue
+            paper_record = self.paper_registry.get(paper.id, PaperRecord())
+            if paper_record.posted:
+                self.logger.info(f"Paper {paper.id} was already posted in a previous run, skipping.")
+                self.posted_in_this_run.add(paper.id)
                 continue
 
             self.logger.info(f"Processing paper: '{paper.title}' ({paper.id})")
 
-            # Format message
-            message = format_paper_message(paper, self.settings)
+            send_result = await self._send_paper_message(channel, paper, event_type="new")
+            self.posted_in_this_run.add(paper.id)
 
-            if message:
-                if self.settings.no_send:
-                    self.logger.info(f"[NO_SEND] Would post message for paper: {paper.title}")
-                    self.logger.debug(f"Message content:\n{message}") # Log message if not sending
-                else:
-                    try:
-                        self.logger.info(f"Sending message for paper: {paper.title}")
-                        await channel.send(message)
-                        papers_posted_count += 1
-                        await asyncio.sleep(1) # Small delay between messages
-                    except discord.errors.HTTPException as e:
-                        self.logger.error(f"Discord API error sending message for '{paper.title}': {e.status} {e.code} - {e.text}")
-                    except Exception as e:
-                         self.logger.exception(f"Unexpected error sending message for '{paper.title}': {e}")
+            if send_result is True:
+                papers_posted_count += 1
+                record = self._update_paper_record(
+                    paper,
+                    posted=True,
+                    published=bool(paper.journal_ref or paper.doi),
+                )
+                self.paper_registry[paper.id] = record
 
-                # Mark as processed for this run regardless of send success (prevents retries in same run)
+                if self.settings.source == API_SOURCE:
+                    paper_published_naive = paper.published.replace(tzinfo=None)
+                    if latest_paper_time is None:
+                        latest_paper_time = paper.published
+                    else:
+                        current_latest = latest_paper_time.replace(tzinfo=None)
+                        if paper_published_naive > current_latest:
+                            latest_paper_time = paper.published
+            elif send_result is False:
+                self.logger.warning(f"Skipping paper '{paper.title}' because message formatting failed (likely too long).")
                 self.posted_in_this_run.add(paper.id)
 
-                # Track the latest published time for API state saving
-                # Use timezone-naive comparison if needed, or ensure consistency
-                # Assuming paper.published is timezone-aware (UTC from API/RSS parser)
-                # Convert last_api_check_time to aware UTC if it's naive
-                if self.settings.source == API_SOURCE:
-                     paper_published_naive = paper.published.replace(tzinfo=None)
-    
-                     if latest_paper_time is None:
-                          latest_paper_time = paper.published
-                     else:
-                          current_latest = latest_paper_time.replace(tzinfo=None)
-                          if paper_published_naive > current_latest:
-                               latest_paper_time = paper.published # Keep the original aware object
+        publication_updates_count = await self._check_for_publication_updates(channel)
 
-            else:
-                self.logger.warning(f"Skipping paper '{paper.title}' because message formatting failed (likely too long).")
-                self.posted_in_this_run.add(paper.id) # Also mark as processed to avoid retrying
-
-
-        self.logger.info(f"Finished processing. Posted {papers_posted_count} new paper notifications.")
+        if papers_posted_count == 0 and publication_updates_count == 0:
+            self.logger.info("No new papers or publication updates found matching criteria.")
+        else:
+            self.logger.info(
+                f"Finished processing. Posted {papers_posted_count} new paper notifications and "
+                f"{publication_updates_count} publication updates."
+            )
 
         # --- State Saving ---
         # Only save state if papers were actually processed or checked
@@ -152,6 +154,89 @@ class ArxivBotClient(discord.Client):
              # This covers cases where papers were found or where the check ran but found nothing new.
              if not self.state_manager.has_checked_rss_today() or self.settings.force_rss_check:
                  self.state_manager.save_rss_check_time()
+
+    async def _check_for_publication_updates(self, channel: discord.TextChannel) -> int:
+        """Checks whether already-posted arXiv papers now have publication metadata."""
+        # Only revisit papers that have already been announced in Discord but
+        # have not yet been marked as published in the registry.
+        tracked_ids = [
+            paper_id
+            for paper_id, record in self.paper_registry.items()
+            if record.posted and not record.published
+        ]
+
+        if not tracked_ids:
+            self.logger.info("No tracked unpublished papers require publication checks.")
+            return 0
+
+        self.logger.info(f"Checking publication status for {len(tracked_ids)} tracked papers.")
+        try:
+            publication_candidates = await self.fetcher.fetch_publication_updates(tracked_ids)
+        except Exception as e:
+            self.logger.exception(f"Failed to refresh publication metadata: {e}")
+            return 0
+
+        updates_sent = 0
+        for paper in publication_candidates:
+            if paper.id in self.publication_updates_in_this_run:
+                continue
+
+            current_record = self.paper_registry.get(paper.id, PaperRecord())
+            if not current_record.posted or current_record.published:
+                continue
+
+            # Once a publication update is successfully sent, the registry is
+            # flipped to published=True so the message is emitted only once.
+            send_result = await self._send_paper_message(channel, paper, event_type="published")
+            self.publication_updates_in_this_run.add(paper.id)
+            if send_result is not True:
+                continue
+
+            updates_sent += 1
+            record = self._update_paper_record(paper, published=True)
+            self.paper_registry[paper.id] = record
+
+        return updates_sent
+
+    async def _send_paper_message(self, channel: discord.TextChannel, paper: Paper, *, event_type: str) -> Optional[bool]:
+        """Formats and sends a Discord message.
+
+        Returns True when a message was delivered, False when formatting failed, and
+        None during --nosend dry runs.
+        """
+        message = format_paper_message(paper, self.settings, event_type=event_type)
+        if not message:
+            return False
+
+        if self.settings.no_send:
+            self.logger.info(f"[NO_SEND] Would post {event_type} message for paper: {paper.title}")
+            self.logger.debug(f"Message content:\n{message}")
+            return None
+
+        try:
+            self.logger.info(f"Sending {event_type} message for paper: {paper.title}")
+            await channel.send(message)
+            await asyncio.sleep(1)
+            return True
+        except discord.errors.HTTPException as e:
+            self.logger.error(f"Discord API error sending message for '{paper.title}': {e.status} {e.code} - {e.text}")
+        except Exception as e:
+            self.logger.exception(f"Unexpected error sending message for '{paper.title}': {e}")
+        return False
+
+    def _update_paper_record(self, paper: Paper, *, posted: Optional[bool] = None, published: Optional[bool] = None) -> PaperRecord:
+        """Persists tracked-paper state and returns the updated in-memory record."""
+        # Keep the registry updates centralized so both the in-memory state and
+        # the on-disk JSON-lines file stay in sync.
+        record = self.state_manager.upsert_paper_record(
+            paper.id,
+            posted=posted,
+            published=published,
+            doi=paper.doi,
+            journal_ref=paper.journal_ref,
+        )
+        self.paper_registry[paper.id] = record
+        return record
 
 async def run_bot():
     """Loads settings, sets up components, and starts the bot."""
@@ -167,7 +252,8 @@ async def run_bot():
 
         bot = ArxivBotClient(settings=settings, state_manager=state_manager, fetcher=fetcher)
 
-        await bot.start(settings.discord_token)
+        async with bot:
+            await bot.start(settings.discord_token, reconnect=False)
 
     except ValueError as e:
          logging.error(f"Configuration error: {e}")
@@ -190,4 +276,7 @@ async def run_bot():
 
 
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        logging.info("Shutdown requested via KeyboardInterrupt.")

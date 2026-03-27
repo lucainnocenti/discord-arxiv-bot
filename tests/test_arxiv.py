@@ -26,6 +26,7 @@
 import arxiv
 from datetime import datetime
 
+
 def main():
     # List of authors to search for
     authors = [
@@ -42,7 +43,7 @@ def main():
     # 1. category: quant-ph
     # 2. any of our authors (join with OR)
     # 3. submitted after the chosen date
-    authors_query = " OR ".join(f'au:"{a}"' for a in authors)
+    authors_query = " OR ".join(f'au:\"{a}\"' for a in authors)
     query_str = (
         f'cat:quant-ph AND ({authors_query}) '
         f'AND submittedDate:[{date_str} TO 20250319]'
@@ -68,6 +69,7 @@ def main():
         print("Date:     ", paper.published.strftime('%Y-%m-%d'))
         print("URL:      ", paper.entry_id)
         print("-" * 60)
+
 
 if __name__ == "__main__":
     main()
