@@ -1,3 +1,5 @@
+"""Small Discord utility bot for channel creation commands and DM forwarding."""
+
 import logging
 import discord
 from discord.ext import commands
@@ -24,6 +26,8 @@ client = commands.Bot(command_prefix="!", intents=intents)
     guild=discord.Object(id=GUILD_ID)
 )
 async def create_channel(interaction: discord.Interaction, name: str, category: discord.CategoryChannel):
+    # Slash commands can be invoked in DMs, so guard against missing guild state
+    # before attempting any server-side channel creation.
     if interaction.guild is None:
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
@@ -50,6 +54,8 @@ async def create_private_channel(interaction: discord.Interaction, name: str, ca
         await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
 
+    # Override the default role to hide the channel from the server at large,
+    # then explicitly grant access back to the requesting user.
     overwrites = {
         interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
         interaction.user: discord.PermissionOverwrite(read_messages=True)
@@ -70,6 +76,8 @@ async def create_private_channel(interaction: discord.Interaction, name: str, ca
 @client.event
 async def on_ready():
     try:
+        # Explicit guild sync keeps command registration scoped to the target
+        # server instead of relying on slower global propagation.
         synced = await client.tree.sync(guild=discord.Object(id=GUILD_ID))
         logging.info("Synced %s command(s)", len(synced))
     except Exception as e:
@@ -84,6 +92,8 @@ async def on_message(message: discord.Message):
 
     if isinstance(message.channel, discord.DMChannel):
         try:
+            # Forward DMs to a fixed operator account so users can message the
+            # bot privately without the messages being lost in a DM inbox.
             target_user = await client.fetch_user(TARGET_USER_ID)
             forwarded_message = (
                 f"**Forwarded DM**\n"

@@ -1,9 +1,12 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+.pycache-check/
+.python-user/
 
 
 # Configuration file containing sensitive information
 config.py
+openai_apikey.py
 script.sh
 bot.log
 last_submission_date.txt

@@ -1,4 +1,5 @@
-# main.py (or bot.py)
+"""Discord bot entrypoint for fetching, formatting, and posting arXiv updates."""
+
 import discord
 import asyncio
 import logging
@@ -64,7 +65,8 @@ class ArxivBotClient(discord.Client):
         """The main logic: fetch, filter, format, post, then check for publication updates."""
         await self.wait_until_ready() # Ensure internal cache is ready
 
-        # determine whether to use test channel or production channel
+        # Resolve the destination once up front so the rest of the run can treat
+        # "post to Discord" as a single target regardless of test/prod mode.
         target_channel_id = self.settings.test_channel_id if self.settings.use_test_channel else self.settings.channel_id
         channel = self.get_channel(target_channel_id)
 
@@ -74,6 +76,8 @@ class ArxivBotClient(discord.Client):
         self.logger.info(f"Operating in channel: {channel.name} ({channel.id})")
 
         # --- Fetching ---
+        # API mode uses a timestamp cursor; RSS mode is a daily poll because the
+        # feed is already a small rolling window rather than a full history.
         last_api_check_time = self.state_manager.get_last_api_check_time()
 
         # RSS is polled at most once per day because the feed is a rolling window.
@@ -101,6 +105,10 @@ class ArxivBotClient(discord.Client):
             if paper.id in self.posted_in_this_run:
                 self.logger.info(f"Paper {paper.id} already processed in this run, skipping.")
                 continue
+
+            # Enrich before deciding whether to post so the initial announcement
+            # already includes DOI/journal data when arXiv or Crossref has it.
+            paper = await self.fetcher.enrich_publication_metadata(paper)
             paper_record = self.paper_registry.get(paper.id, PaperRecord())
             if paper_record.posted:
                 self.logger.info(f"Paper {paper.id} was already posted in a previous run, skipping.")
@@ -122,6 +130,8 @@ class ArxivBotClient(discord.Client):
                 self.paper_registry[paper.id] = record
 
                 if self.settings.source == API_SOURCE:
+                    # Advance the API cursor to the newest published timestamp we
+                    # actually processed so the next run stays incremental.
                     paper_published_naive = paper.published.replace(tzinfo=None)
                     if latest_paper_time is None:
                         latest_paper_time = paper.published
@@ -133,6 +143,8 @@ class ArxivBotClient(discord.Client):
                 self.logger.warning(f"Skipping paper '{paper.title}' because message formatting failed (likely too long).")
                 self.posted_in_this_run.add(paper.id)
 
+        # Second pass: revisit already-posted papers that still look
+        # unpublished and emit a shorter "now published" message if needed.
         publication_updates_count = await self._check_for_publication_updates(channel)
 
         if papers_posted_count == 0 and publication_updates_count == 0:
@@ -144,7 +156,8 @@ class ArxivBotClient(discord.Client):
             )
 
         # --- State Saving ---
-        # Only save state if papers were actually processed or checked
+        # Persist cursors after the posting logic finishes so a failed Discord
+        # send does not silently move the checkpoint past an unsent paper.
         if self.settings.source == API_SOURCE and latest_paper_time:
             # Save the timestamp of the *latest* paper found in this batch
              self.logger.info(f"Latest paper time found for API source: {latest_paper_time}")
@@ -181,6 +194,8 @@ class ArxivBotClient(discord.Client):
             if paper.id in self.publication_updates_in_this_run:
                 continue
 
+            # Re-read the current record in case earlier work in this same run
+            # already flipped the publication flag.
             current_record = self.paper_registry.get(paper.id, PaperRecord())
             if not current_record.posted or current_record.published:
                 continue
@@ -204,6 +219,8 @@ class ArxivBotClient(discord.Client):
         Returns True when a message was delivered, False when formatting failed, and
         None during --nosend dry runs.
         """
+        # Keep formatting separate from transport so long-message failures are
+        # caught before we call the Discord API.
         message = format_paper_message(paper, self.settings, event_type=event_type)
         if not message:
             return False
@@ -241,11 +258,13 @@ class ArxivBotClient(discord.Client):
 async def run_bot():
     """Loads settings, sets up components, and starts the bot."""
     try:
-        settings = load_settings() # parse command line arguments and store in settings
-        setup_logging(settings.log_path) # Setup logging early
+        settings = load_settings() # Parse command line arguments once into a typed settings object.
+        setup_logging(settings.log_path) # Setup logging early so downstream startup failures are captured.
         logging.info("Configuration loaded successfully.")
         logging.info(f"Running with source: {settings.source}, Test Channel: {settings.use_test_channel}, No Save: {settings.no_save}, No Send: {settings.no_send}")
 
+        # The runtime is deliberately split into state, fetch, and Discord
+        # layers so each concern can be tested or changed independently.
         state_manager = StateManager(settings)
         fetcher = ArxivFetcher(settings)
         # Formatter is functional, no class needed unless it grows state

@@ -1,4 +1,5 @@
-# discord_formatter.py
+"""Formatting helpers that keep paper announcements within Discord limits."""
+
 import logging
 from typing import Dict, List, Optional
 
@@ -24,6 +25,8 @@ def format_paper_message(paper: Paper, settings: AppSettings, event_type: str = 
 
     summary = paper.summary
     if len(summary) > MAX_SUMMARY_LEN:
+        # Trim early so the later template-length fallback only has to deal
+        # with title/author growth, not arbitrarily long abstracts.
         summary = summary[:MAX_SUMMARY_LEN] + "... [truncated]"
 
     published_str = paper.published.strftime('%Y-%m-%d')
@@ -55,6 +58,8 @@ def format_paper_message(paper: Paper, settings: AppSettings, event_type: str = 
 
     if len(message) > MAX_DISCORD_MSG_LEN:
         logging.info(f"Message for '{paper.title}' too long with full authors, trying 'et al.'")
+        # Preserve the full abstract when possible by shortening the author list
+        # before giving up on the message entirely.
         first_author = paper.authors[0] if paper.authors else "Unknown"
         message = message_template.format(
             target_authors=target_authors_str,
@@ -117,6 +122,8 @@ def _build_target_authors_string(
         return "tracked authors"
 
     if paper_authors:
+        # Put the first matching author first in the mention string so the alert
+        # reads naturally when a tracked author leads the paper.
         first_author_lower = paper_authors[0].lower()
         for i, target in enumerate(target_in_paper):
             if target.lower() == first_author_lower:

@@ -134,7 +134,8 @@ class ArxivFetcher:
             # If arXiv itself already exposes publication metadata, prefer that
             # over any external inference.
             if paper.journal_ref or paper.doi:
-                publication_updates.append(paper._replace(announce_type='published_metadata'))
+                enriched = await self.enrich_publication_metadata(paper)
+                publication_updates.append(enriched._replace(announce_type='published_metadata'))
                 continue
 
             # Crossref is only consulted for papers that still look unpublished
@@ -144,6 +145,41 @@ class ArxivFetcher:
                 publication_updates.append(crossref_match)
 
         return publication_updates
+
+    async def enrich_publication_metadata(self, paper: Paper) -> Paper:
+        """Normalizes journal metadata and upgrades sparse refs when Crossref can help."""
+        # Normalize first so later checks do not have to care about blank strings
+        # versus None when deciding whether metadata is actually present.
+        normalized_paper = paper._replace(
+            doi=self._clean_optional_text(paper.doi),
+            journal_ref=self._clean_optional_text(paper.journal_ref),
+        )
+        if not normalized_paper.doi and not normalized_paper.journal_ref:
+            return normalized_paper
+
+        loop = asyncio.get_event_loop()
+
+        if normalized_paper.doi:
+            # A DOI is the strongest key Crossref offers, so try that before any
+            # fuzzier title/author matching.
+            crossref_item = await loop.run_in_executor(None, self._fetch_crossref_work_by_doi, normalized_paper.doi)
+            if crossref_item:
+                enriched = self._paper_from_crossref_item(
+                    normalized_paper,
+                    crossref_item,
+                    announce_type='crossref_doi',
+                )
+                if enriched:
+                    return enriched
+
+        if self._journal_ref_needs_enrichment(normalized_paper.journal_ref):
+            # Fall back to a conservative search only when the existing journal
+            # reference looks too sparse to be useful in Discord messages.
+            crossref_match = await loop.run_in_executor(None, self._find_crossref_publication, normalized_paper)
+            if crossref_match:
+                return crossref_match
+
+        return normalized_paper
 
     async def _fetch_from_api(self, last_submission_date: datetime) -> List[Paper]:
         """
@@ -164,6 +200,8 @@ class ArxivFetcher:
         filtered_authors: List[str] = []
         seen_filtered = set()
         for author in all_authors:
+            # The API query is more reliable with full names than with bare
+            # initials, so skip low-signal variants when a better form exists.
             parts = author.split()
             if len(parts) < 2:
                 continue
@@ -186,6 +224,8 @@ class ArxivFetcher:
             author_chunks: List[List[str]] = [[]]
         else:
             max_authors_per_query = 20
+            # Split large author lists so the final query string stays within
+            # the size arXiv accepts and failures affect only one chunk.
             author_chunks = [
                 authors[i:i + max_authors_per_query]
                 for i in range(0, len(authors), max_authors_per_query)
@@ -249,6 +289,8 @@ class ArxivFetcher:
                     break
 
             for result in chunk_results:
+                # Multiple author chunks can surface the same paper, so dedupe
+                # before normalization to keep downstream posting stable.
                 if result.entry_id in seen_entry_ids:
                     continue
                 seen_entry_ids.add(result.entry_id)
@@ -363,7 +405,8 @@ class ArxivFetcher:
                 # Attempt to normalize the raw RSS entry into our Paper structure
                 paper = self._normalize_rss_entry(entry)
 
-                # If normalization was successful, check if any author matches our target list
+                # RSS filtering happens client-side because the feed itself only
+                # filters by category, not by author.
                 if paper and self._is_author_match(paper.authors):
                     papers.append(paper) # Add the paper if it's valid and matches an author
 
@@ -425,8 +468,8 @@ class ArxivFetcher:
             summary=summary_cleaned,
             link=entry_id_url, # Link is the same as the ID (abstract URL)
             pdf_link=pdf_link,
-            doi=result.doi, # DOI may be present for journal-published works
-            journal_ref=result.journal_ref, # May be None if not available
+            doi=self._clean_optional_text(result.doi), # DOI may be present for journal-published works
+            journal_ref=self._clean_optional_text(result.journal_ref), # May be None if not available
             announce_type='api_new' # Mark source as API; API doesn't distinguish announce types
         )
 
@@ -564,8 +607,8 @@ class ArxivFetcher:
             summary=summary,        # Cleaned string
             link=link,              # Validated string
             pdf_link=pdf_link,      # Constructed string
-            doi=doi,                # Optional[str]
-            journal_ref=journal_ref, # Optional[str]
+            doi=self._clean_optional_text(doi),                # Optional[str]
+            journal_ref=self._clean_optional_text(journal_ref), # Optional[str]
             announce_type=announce_type # Optional[str]
         )
 
@@ -581,7 +624,7 @@ class ArxivFetcher:
             "query.title": paper.title,
             "query.author": paper.authors[0],
             "filter": "type:journal-article",
-            "select": "DOI,title,author,container-title,type",
+            "select": "DOI,title,author,container-title,type,volume,issue,page,article-number,published-print,published-online,issued",
         }
         if self.settings.crossref_mailto:
             params["mailto"] = self.settings.crossref_mailto
@@ -603,12 +646,31 @@ class ArxivFetcher:
             return None
 
         for item in items:
+            # Stop at the first high-confidence match; this path is meant to be
+            # conservative, not exhaustive.
             candidate = self._crossref_item_to_publication_update(paper, item)
             if candidate:
                 self.logger.info(f"Crossref matched tracked paper {paper.id} to DOI {candidate.doi}.")
                 return candidate
 
         return None
+
+    def _fetch_crossref_work_by_doi(self, doi: str) -> Optional[Dict[str, Any]]:
+        """Fetches a specific Crossref work by DOI."""
+        request = urllib.request.Request(
+            f"{CROSSREF_API_URL}/{urllib.parse.quote(doi)}",
+            headers={"User-Agent": self._crossref_user_agent()},
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                payload = json.load(response)
+        except Exception as e:
+            self.logger.warning(f"Crossref DOI lookup failed for {doi}: {e}")
+            return None
+
+        item = payload.get("message")
+        return item if isinstance(item, dict) else None
 
     def _crossref_item_to_publication_update(self, paper: Paper, item: Dict[str, Any]) -> Optional[Paper]:
         """Validates a Crossref record and converts it into a publication update."""
@@ -625,18 +687,7 @@ class ArxivFetcher:
         if not crossref_title or not self._is_probable_crossref_match(paper, crossref_title, authors):
             return None
 
-        container_titles = item.get("container-title", [])
-        journal_ref = None
-        if isinstance(container_titles, list) and container_titles:
-            first_container_title = container_titles[0]
-            if isinstance(first_container_title, str) and first_container_title.strip():
-                journal_ref = first_container_title.strip()
-
-        return paper._replace(
-            doi=doi,
-            journal_ref=paper.journal_ref or journal_ref,
-            announce_type='crossref_published',
-        )
+        return self._paper_from_crossref_item(paper, item, announce_type='crossref_published')
 
     def _is_probable_crossref_match(
         self,
@@ -681,9 +732,121 @@ class ArxivFetcher:
             return f"arxiv-discord-bot/1.0 (mailto:{self.settings.crossref_mailto})"
         return "arxiv-discord-bot/1.0"
 
+    def _paper_from_crossref_item(
+        self,
+        paper: Paper,
+        item: Dict[str, Any],
+        *,
+        announce_type: str,
+    ) -> Optional[Paper]:
+        """Merges the best DOI and journal reference available from a Crossref item."""
+        doi = self._clean_optional_text(item.get("DOI")) or paper.doi
+        journal_ref = self._choose_better_journal_ref(
+            paper.journal_ref,
+            self._format_crossref_journal_ref(item),
+        )
+
+        if not doi and not journal_ref:
+            return None
+
+        return paper._replace(
+            doi=doi,
+            journal_ref=journal_ref,
+            announce_type=announce_type,
+        )
+
+    def _format_crossref_journal_ref(self, item: Dict[str, Any]) -> Optional[str]:
+        """Builds a consistent citation string from a Crossref work when enough fields exist."""
+        container_titles = item.get("container-title", [])
+        journal = None
+        if isinstance(container_titles, list) and container_titles:
+            first_container_title = container_titles[0]
+            if isinstance(first_container_title, str):
+                journal = self._clean_optional_text(first_container_title)
+
+        if not journal:
+            return None
+
+        volume = self._clean_optional_text(item.get("volume"))
+        issue = self._clean_optional_text(item.get("issue"))
+        pages = self._clean_optional_text(item.get("page")) or self._clean_optional_text(item.get("article-number"))
+        year = self._extract_crossref_year(item)
+
+        citation = journal
+        if volume:
+            citation += f" {volume}"
+            if issue:
+                citation += f".{issue}"
+        if year:
+            citation += f" ({year})"
+        if pages:
+            citation += f": {pages}"
+
+        return citation
+
+    def _extract_crossref_year(self, item: Dict[str, Any]) -> Optional[str]:
+        """Returns the most useful year present in a Crossref record."""
+        for field in ("published-print", "published-online", "issued"):
+            date_part = item.get(field)
+            if not isinstance(date_part, dict):
+                continue
+            parts = date_part.get("date-parts")
+            if not isinstance(parts, list) or not parts:
+                continue
+            first = parts[0]
+            if not isinstance(first, list) or not first:
+                continue
+            year = first[0]
+            if isinstance(year, int):
+                return str(year)
+            if isinstance(year, str):
+                cleaned = year.strip()
+                if cleaned:
+                    return cleaned
+        return None
+
+    def _choose_better_journal_ref(self, current: Optional[str], candidate: Optional[str]) -> Optional[str]:
+        """Prefers the more informative journal reference."""
+        current_clean = self._clean_optional_text(current)
+        candidate_clean = self._clean_optional_text(candidate)
+        if not candidate_clean:
+            return current_clean
+        if not current_clean:
+            return candidate_clean
+        if self._journal_ref_score(candidate_clean) > self._journal_ref_score(current_clean):
+            return candidate_clean
+        return current_clean
+
+    def _journal_ref_needs_enrichment(self, journal_ref: Optional[str]) -> bool:
+        """Returns True when the current journal reference looks sparse."""
+        cleaned = self._clean_optional_text(journal_ref)
+        if not cleaned:
+            return True
+        return self._journal_ref_score(cleaned) < 2
+
+    def _journal_ref_score(self, journal_ref: str) -> int:
+        """Scores how citation-like a journal reference is."""
+        score = 0
+        if re.search(r'\b\d{4}\b', journal_ref):
+            score += 1
+        if re.search(r'\b\d+(?:\.\d+)?\b', journal_ref):
+            score += 1
+        if ":" in journal_ref or re.search(r'\b[A-Z]?\d{4,}\b', journal_ref):
+            score += 1
+        return score
+
+    def _clean_optional_text(self, value: Any) -> Optional[str]:
+        """Strips text fields and normalizes blank strings to None."""
+        if not isinstance(value, str):
+            return None
+        cleaned = value.strip()
+        return cleaned or None
+
     def _normalize_title_for_match(self, title: str) -> str:
+        """Lowercases and strips punctuation so near-identical titles compare reliably."""
         return TITLE_NORMALIZATION_PATTERN.sub('', title.casefold())
 
     def _extract_family_name(self, author_name: str) -> str:
+        """Extracts a loose last-name token for conservative author matching."""
         tokens = TITLE_NORMALIZATION_PATTERN.sub(' ', author_name.casefold()).split()
         return tokens[-1] if tokens else ""

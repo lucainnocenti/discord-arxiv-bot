@@ -1,4 +1,5 @@
-# state_manager.py
+"""Persistence helpers for the bot's posting cursors and tracked-paper registry."""
+
 import json
 import os
 import logging
@@ -39,6 +40,8 @@ class StateManager:
                     if not line:
                         continue
 
+                    # Parse one logical record per line so the file stays easy to
+                    # inspect and recover manually if needed.
                     paper_id, record = self._parse_registry_line(line)
                     if not paper_id:
                         continue
@@ -87,6 +90,8 @@ class StateManager:
         canonical_paper_id = canonicalize_paper_id(paper_id)
         current = registry.get(canonical_paper_id, PaperRecord())
         updated = PaperRecord(
+            # Treat posted/published as sticky flags: once True, never revert to
+            # False just because a later call omitted that field.
             posted=current.posted or bool(posted),
             published=current.published or bool(published),
             doi=doi or current.doi,
@@ -137,6 +142,7 @@ class StateManager:
         file_path = self.settings.last_submission_file
         try:
             # Add a small delta to avoid reprocessing the exact same timestamp
+            # on the next inclusive arXiv API query.
             save_time = time + timedelta(seconds=1)
             with open(file_path, 'w') as f:
                 f.write(save_time.isoformat())
@@ -167,6 +173,8 @@ class StateManager:
              logging.info(f"{self.settings.last_rss_check_file} not found or unreadable. Assuming RSS not checked today.")
              return False # Treat as not checked if file missing/error
 
+        # The arXiv RSS feed is published on an Eastern Time cadence, so use the
+        # same timezone when deciding whether "today's" poll already ran.
         current_date_et = datetime.now(EASTERN_TZ).date()
         has_checked = last_check_date == current_date_et
         if has_checked:
@@ -223,6 +231,7 @@ class StateManager:
         file_path = self.settings.posted_papers_file
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
+                # Sort by canonical paper ID so diffs stay stable across runs.
                 for paper_id in sorted(registry):
                     record = registry[paper_id]
                     payload = {"id": paper_id, **asdict(record)}

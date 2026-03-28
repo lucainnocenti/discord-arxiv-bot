@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import tempfile
 import unittest
 from contextlib import contextmanager
 from datetime import datetime
@@ -15,7 +16,7 @@ from state_manager import PaperRecord, StateManager
 
 @contextmanager
 def workspace_tempdir():
-    tmpdir = os.path.join(os.getcwd(), f"test-publication-{uuid4().hex}")
+    tmpdir = os.path.join(tempfile.gettempdir(), f"test-publication-{uuid4().hex}")
     os.makedirs(tmpdir, exist_ok=True)
     try:
         yield tmpdir
@@ -131,6 +132,33 @@ class PublicationTrackingTests(unittest.TestCase):
             self.assertIsNotNone(matched)
             self.assertEqual(matched.doi, "10.3000/article")
             self.assertIsNone(rejected)
+
+    def test_crossref_formats_full_journal_reference(self):
+        with workspace_tempdir() as tmpdir:
+            settings = make_settings(tmpdir)
+            fetcher = ArxivFetcher(settings)
+
+            journal_ref = fetcher._format_crossref_journal_ref({
+                "container-title": ["Physical Review A"],
+                "volume": "113",
+                "issue": "3",
+                "article-number": "032201",
+                "published-print": {"date-parts": [[2026, 3, 1]]},
+            })
+
+            self.assertEqual(journal_ref, "Physical Review A 113.3 (2026): 032201")
+
+    def test_choose_better_journal_ref_prefers_full_citation(self):
+        with workspace_tempdir() as tmpdir:
+            settings = make_settings(tmpdir)
+            fetcher = ArxivFetcher(settings)
+
+            chosen = fetcher._choose_better_journal_ref(
+                "New Journal of Physics",
+                "New Journal of Physics 28.1 (2026): 012345",
+            )
+
+            self.assertEqual(chosen, "New Journal of Physics 28.1 (2026): 012345")
 
 
 if __name__ == "__main__":
