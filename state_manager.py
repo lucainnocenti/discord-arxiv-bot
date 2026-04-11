@@ -3,10 +3,10 @@
 import json
 import os
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from settings import AppSettings, EASTERN_TZ # Import shared settings and constants
 from arxiv_fetcher import canonicalize_paper_id
@@ -20,6 +20,8 @@ class PaperRecord:
     published: bool = False
     doi: Optional[str] = None
     journal_ref: Optional[str] = None
+    title: Optional[str] = None
+    authors: List[str] = field(default_factory=list)
 
 class StateManager:
     def __init__(self, settings: AppSettings):
@@ -54,6 +56,8 @@ class StateManager:
                         published=existing.published or record.published,
                         doi=record.doi or existing.doi,
                         journal_ref=record.journal_ref or existing.journal_ref,
+                        title=record.title or existing.title,
+                        authors=record.authors or existing.authors,
                     )
 
             logging.info(f"Loaded {len(registry)} tracked paper records from {file_path}")
@@ -82,6 +86,8 @@ class StateManager:
         published: Optional[bool] = None,
         doi: Optional[str] = None,
         journal_ref: Optional[str] = None,
+        title: Optional[str] = None,
+        authors: Optional[List[str]] = None,
     ) -> PaperRecord:
         """Creates or updates a tracked paper record and rewrites the registry file."""
         # The registry is small, so the simplest and safest approach is to
@@ -96,6 +102,8 @@ class StateManager:
             published=current.published or bool(published),
             doi=doi or current.doi,
             journal_ref=journal_ref or current.journal_ref,
+            title=title or current.title,
+            authors=list(authors) if authors is not None else list(current.authors),
         )
         registry[canonical_paper_id] = updated
 
@@ -217,6 +225,12 @@ class StateManager:
                     published=bool(data.get("published", False)),
                     doi=data.get("doi") if isinstance(data.get("doi"), str) else None,
                     journal_ref=data.get("journal_ref") if isinstance(data.get("journal_ref"), str) else None,
+                    title=data.get("title") if isinstance(data.get("title"), str) else None,
+                    authors=[
+                        author
+                        for author in data.get("authors", [])
+                        if isinstance(author, str)
+                    ] if isinstance(data.get("authors"), list) else [],
                 )
             except Exception as e:
                 logging.warning(f"Skipping unreadable tracked-paper record '{line}': {e}")

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import shutil
@@ -5,10 +6,11 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from datetime import datetime
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from arxiv_fetcher import ArxivFetcher, Paper
+from arxiv_fetcher import ArxivFetcher, FetchPapersByIdResult, Paper, TrackedPaperMetadata
 from discord_formatter import format_paper_message
 from settings import AppSettings
 from state_manager import PaperRecord, StateManager
@@ -84,6 +86,8 @@ class PublicationTrackingTests(unittest.TestCase):
                 published=True,
                 doi="10.2000/final",
                 journal_ref="Physics Letters",
+                title="A Useful Quantum Paper",
+                authors=["Alice Example", "Bob Example"],
             )
 
             self.assertTrue(record.posted)
@@ -91,6 +95,8 @@ class PublicationTrackingTests(unittest.TestCase):
 
             registry = manager.get_paper_registry()
             self.assertEqual(registry["2603.99999"].journal_ref, "Physics Letters")
+            self.assertEqual(registry["2603.99999"].title, "A Useful Quantum Paper")
+            self.assertEqual(registry["2603.99999"].authors, ["Alice Example", "Bob Example"])
 
     def test_format_publication_message_includes_doi(self):
         with workspace_tempdir() as tmpdir:
@@ -159,6 +165,172 @@ class PublicationTrackingTests(unittest.TestCase):
             )
 
             self.assertEqual(chosen, "New Journal of Physics 28.1 (2026): 012345")
+
+    def test_fetch_publication_updates_reports_partial_refresh(self):
+        with workspace_tempdir() as tmpdir:
+            settings = make_settings(tmpdir)
+            fetcher = ArxivFetcher(settings)
+            fetched_paper = make_paper(doi="10.1000/example", journal_ref="Journal of Tests")
+
+            async def fake_fetch(_paper_ids):
+                return FetchPapersByIdResult(
+                    papers=[fetched_paper],
+                    requested_ids=["2603.99999", "2603.88888"],
+                    failed_ids=["2603.88888"],
+                    degraded=True,
+                )
+
+            fetcher._fetch_papers_by_ids = fake_fetch  # type: ignore[method-assign]
+
+            result = asyncio.run(fetcher.fetch_publication_updates(["2603.99999", "2603.88888"]))
+
+            self.assertTrue(result.degraded)
+            self.assertEqual(result.checked_ids, ["2603.99999"])
+            self.assertEqual(result.failed_ids, ["2603.88888"])
+            self.assertEqual(len(result.updates), 1)
+            self.assertEqual(result.updates[0].announce_type, "published_metadata")
+
+    def test_fetch_publication_updates_queries_crossref_for_unpublished_arxiv_record(self):
+        with workspace_tempdir() as tmpdir:
+            settings = make_settings(tmpdir)
+            fetcher = ArxivFetcher(settings)
+            fetched_paper = make_paper()
+            crossref_match = make_paper(
+                doi="10.3000/article",
+                journal_ref="Quantum Journal 12 (2026): 34",
+                announce_type="crossref_published",
+            )
+
+            async def fake_fetch(_paper_ids):
+                return FetchPapersByIdResult(
+                    papers=[fetched_paper],
+                    requested_ids=["2603.99999"],
+                    failed_ids=[],
+                    degraded=False,
+                )
+
+            fetcher._fetch_papers_by_ids = fake_fetch  # type: ignore[method-assign]
+
+            with patch.object(fetcher, "_find_crossref_publication", return_value=crossref_match) as mock_crossref:
+                result = asyncio.run(fetcher.fetch_publication_updates(["2603.99999"]))
+
+            self.assertEqual(result.checked_ids, ["2603.99999"])
+            self.assertEqual(len(result.updates), 1)
+            self.assertEqual(result.updates[0].doi, "10.3000/article")
+            mock_crossref.assert_called_once_with(fetched_paper)
+
+    def test_fetch_publication_updates_logs_crossref_summary_for_unpublished_arxiv_record(self):
+        with workspace_tempdir() as tmpdir:
+            settings = make_settings(tmpdir)
+            fetcher = ArxivFetcher(settings)
+            fetched_paper = make_paper()
+
+            async def fake_fetch(_paper_ids):
+                return FetchPapersByIdResult(
+                    papers=[fetched_paper],
+                    requested_ids=["2603.99999"],
+                    failed_ids=[],
+                    degraded=False,
+                )
+
+            fetcher._fetch_papers_by_ids = fake_fetch  # type: ignore[method-assign]
+
+            with patch.object(fetcher, "_find_crossref_publication", return_value=None):
+                with self.assertLogs("ArxivFetcher", level="INFO") as captured_logs:
+                    asyncio.run(fetcher.fetch_publication_updates(["2603.99999"]))
+
+            joined_logs = "\n".join(captured_logs.output)
+            self.assertIn("Publication update Crossref summary: 1 requests issued", joined_logs)
+
+    def test_fetch_publication_updates_falls_back_to_crossref_for_failed_arxiv_refresh(self):
+        with workspace_tempdir() as tmpdir:
+            settings = make_settings(tmpdir)
+            fetcher = ArxivFetcher(settings)
+            crossref_match = make_paper(
+                doi="10.3000/article",
+                journal_ref="Quantum Journal 12 (2026): 34",
+                announce_type="crossref_published",
+            )
+
+            async def fake_fetch(_paper_ids):
+                return FetchPapersByIdResult(
+                    papers=[],
+                    requested_ids=["2603.99999"],
+                    failed_ids=["2603.99999"],
+                    degraded=True,
+                )
+
+            fetcher._fetch_papers_by_ids = fake_fetch  # type: ignore[method-assign]
+
+            tracked_metadata = {
+                "2603.99999": TrackedPaperMetadata(
+                    title="A Useful Quantum Paper",
+                    authors=["Alice Example", "Bob Example"],
+                    doi=None,
+                    journal_ref=None,
+                )
+            }
+
+            with patch.object(fetcher, "_find_crossref_publication", return_value=crossref_match) as mock_crossref:
+                result = asyncio.run(
+                    fetcher.fetch_publication_updates(["2603.99999"], tracked_metadata=tracked_metadata)
+                )
+
+            self.assertTrue(result.degraded)
+            self.assertEqual(result.failed_ids, ["2603.99999"])
+            self.assertEqual(len(result.updates), 1)
+            self.assertEqual(result.updates[0].doi, "10.3000/article")
+            mock_crossref.assert_called_once()
+
+    def test_fetch_publication_updates_logs_crossref_summary_for_failed_refresh(self):
+        with workspace_tempdir() as tmpdir:
+            settings = make_settings(tmpdir)
+            fetcher = ArxivFetcher(settings)
+
+            async def fake_fetch(_paper_ids):
+                return FetchPapersByIdResult(
+                    papers=[],
+                    requested_ids=["2603.99999"],
+                    failed_ids=["2603.99999"],
+                    degraded=True,
+                )
+
+            fetcher._fetch_papers_by_ids = fake_fetch  # type: ignore[method-assign]
+
+            with patch.object(fetcher, "_find_crossref_publication", return_value=None):
+                with self.assertLogs("ArxivFetcher", level="INFO") as captured_logs:
+                    asyncio.run(
+                        fetcher.fetch_publication_updates(
+                            ["2603.99999"],
+                            tracked_metadata={
+                                "2603.99999": TrackedPaperMetadata(
+                                    title="A Useful Quantum Paper",
+                                    authors=["Alice Example", "Bob Example"],
+                                    doi=None,
+                                    journal_ref=None,
+                                )
+                            },
+                        )
+                    )
+
+            joined_logs = "\n".join(captured_logs.output)
+            self.assertIn("Publication update Crossref summary: 1 requests issued", joined_logs)
+            self.assertIn("Crossref-only fallback attempted for 1 failed arXiv refreshes", joined_logs)
+
+    def test_fetch_papers_by_ids_marks_transient_failure_as_degraded(self):
+        with workspace_tempdir() as tmpdir:
+            settings = make_settings(tmpdir)
+            fetcher = ArxivFetcher(settings)
+
+            with patch.object(fetcher.arxiv_client, "results", side_effect=Exception("HTTP 429")) as mock_results:
+                with patch("arxiv_fetcher.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+                    result = asyncio.run(fetcher._fetch_papers_by_ids(["2603.99999"]))
+
+            self.assertTrue(result.degraded)
+            self.assertEqual(result.papers, [])
+            self.assertEqual(result.failed_ids, ["2603.99999"])
+            self.assertEqual(mock_results.call_count, 3)
+            self.assertEqual(mock_sleep.await_count, 2)
 
 
 if __name__ == "__main__":

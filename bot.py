@@ -10,7 +10,7 @@ from typing import Dict, Optional, Set
 # Import the structured components
 from settings import load_settings, AppSettings, API_SOURCE, RSS_SOURCE
 from state_manager import PaperRecord, StateManager
-from arxiv_fetcher import ArxivFetcher, Paper
+from arxiv_fetcher import ArxivFetcher, Paper, TrackedPaperMetadata
 from discord_formatter import format_paper_message
 
 def setup_logging(log_path: str):
@@ -99,6 +99,7 @@ class ArxivBotClient(discord.Client):
         # for already-known papers are handled in a second pass below.
         papers_posted_count = 0
         publication_updates_count = 0
+        publication_check_degraded = False
         latest_paper_time: Optional[datetime] = None # Keep track for saving API state
 
         for paper in papers_to_post:
@@ -145,15 +146,26 @@ class ArxivBotClient(discord.Client):
 
         # Second pass: revisit already-posted papers that still look
         # unpublished and emit a shorter "now published" message if needed.
-        publication_updates_count = await self._check_for_publication_updates(channel)
+        publication_updates_count, publication_check_degraded = await self._check_for_publication_updates(channel)
 
         if papers_posted_count == 0 and publication_updates_count == 0:
-            self.logger.info("No new papers or publication updates found matching criteria.")
+            if publication_check_degraded:
+                self.logger.warning(
+                    "No new papers were posted, and publication checks were incomplete because "
+                    "arXiv metadata refresh was throttled or temporarily unavailable."
+                )
+            else:
+                self.logger.info("No new papers or publication updates found matching criteria.")
         else:
             self.logger.info(
                 f"Finished processing. Posted {papers_posted_count} new paper notifications and "
                 f"{publication_updates_count} publication updates."
             )
+            if publication_check_degraded:
+                self.logger.warning(
+                    "Publication checks completed with gaps because some tracked papers "
+                    "could not be refreshed from arXiv this run."
+                )
 
         # --- State Saving ---
         # Persist cursors after the posting logic finishes so a failed Discord
@@ -168,29 +180,50 @@ class ArxivBotClient(discord.Client):
              if not self.state_manager.has_checked_rss_today() or self.settings.force_rss_check:
                  self.state_manager.save_rss_check_time()
 
-    async def _check_for_publication_updates(self, channel: discord.TextChannel) -> int:
+    async def _check_for_publication_updates(self, channel: discord.TextChannel) -> tuple[int, bool]:
         """Checks whether already-posted arXiv papers now have publication metadata."""
         # Only revisit papers that have already been announced in Discord but
         # have not yet been marked as published in the registry.
-        tracked_ids = [
-            paper_id
+        tracked_records = {
+            paper_id: record
             for paper_id, record in self.paper_registry.items()
             if record.posted and not record.published
-        ]
+        }
+        tracked_ids = list(tracked_records)
 
         if not tracked_ids:
             self.logger.info("No tracked unpublished papers require publication checks.")
-            return 0
+            return 0, False
 
         self.logger.info(f"Checking publication status for {len(tracked_ids)} tracked papers.")
         try:
-            publication_candidates = await self.fetcher.fetch_publication_updates(tracked_ids)
+            refresh_result = await self.fetcher.fetch_publication_updates(
+                tracked_ids,
+                tracked_metadata={
+                    paper_id: TrackedPaperMetadata(
+                        title=record.title,
+                        authors=list(record.authors),
+                        doi=record.doi,
+                        journal_ref=record.journal_ref,
+                    )
+                    for paper_id, record in tracked_records.items()
+                },
+            )
         except Exception as e:
             self.logger.exception(f"Failed to refresh publication metadata: {e}")
-            return 0
+            return 0, True
+
+        if refresh_result.degraded:
+            self.logger.warning(
+                "Publication metadata refresh was partial: checked %d/%d tracked papers; "
+                "%d were deferred to a future run.",
+                len(refresh_result.checked_ids),
+                len(tracked_ids),
+                len(refresh_result.failed_ids),
+            )
 
         updates_sent = 0
-        for paper in publication_candidates:
+        for paper in refresh_result.updates:
             if paper.id in self.publication_updates_in_this_run:
                 continue
 
@@ -211,7 +244,7 @@ class ArxivBotClient(discord.Client):
             record = self._update_paper_record(paper, published=True)
             self.paper_registry[paper.id] = record
 
-        return updates_sent
+        return updates_sent, refresh_result.degraded
 
     async def _send_paper_message(self, channel: discord.TextChannel, paper: Paper, *, event_type: str) -> Optional[bool]:
         """Formats and sends a Discord message.
@@ -251,6 +284,8 @@ class ArxivBotClient(discord.Client):
             published=published,
             doi=paper.doi,
             journal_ref=paper.journal_ref,
+            title=paper.title,
+            authors=paper.authors,
         )
         self.paper_registry[paper.id] = record
         return record

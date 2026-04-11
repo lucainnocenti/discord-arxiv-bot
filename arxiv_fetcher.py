@@ -38,9 +38,36 @@ class Paper(NamedTuple):
     announce_type: Optional[str] # Type of announcement from RSS (e.g., 'new', 'replace'), or 'api_new' for API results
 
 
+class FetchPapersByIdResult(NamedTuple):
+    """Summarizes a tracked-paper metadata refresh attempt."""
+    papers: List[Paper]
+    requested_ids: List[str]
+    failed_ids: List[str]
+    degraded: bool
+
+
+class PublicationRefreshResult(NamedTuple):
+    """Summarizes publication-update detection for one bot run."""
+    updates: List[Paper]
+    checked_ids: List[str]
+    failed_ids: List[str]
+    degraded: bool
+
+
+class TrackedPaperMetadata(NamedTuple):
+    """Stored metadata retained locally so Crossref can run without a fresh arXiv hit."""
+    title: Optional[str]
+    authors: List[str]
+    doi: Optional[str]
+    journal_ref: Optional[str]
+
+
 ARXIV_ID_PATTERN = re.compile(r'(\d{4}\.\d{4,5})(v\d+)?')
 TITLE_NORMALIZATION_PATTERN = re.compile(r'[^a-z0-9]+')
 CROSSREF_API_URL = "https://api.crossref.org/works"
+HTTP_STATUS_PATTERN = re.compile(r'HTTP (\d{3})')
+TRANSIENT_ARXIV_STATUS_CODES = {429, 500, 502, 503, 504}
+TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS = (20, 60)
 
 
 def canonicalize_paper_id(raw_id: str) -> str:
@@ -114,7 +141,11 @@ class ArxivFetcher:
         self.logger.info(f"Found {len(papers)} papers matching criteria using source '{self.settings.source}'.")
         return papers
 
-    async def fetch_publication_updates(self, tracked_paper_ids: List[str]) -> List[Paper]:
+    async def fetch_publication_updates(
+        self,
+        tracked_paper_ids: List[str],
+        tracked_metadata: Optional[Dict[str, TrackedPaperMetadata]] = None,
+    ) -> PublicationRefreshResult:
         """
         Refreshes tracked arXiv papers and returns the ones that now look published.
 
@@ -124,29 +155,86 @@ class ArxivFetcher:
         conservative fallback when arXiv metadata has not been updated yet.
         """
         if not tracked_paper_ids:
-            return []
+            return PublicationRefreshResult(updates=[], checked_ids=[], failed_ids=[], degraded=False)
 
-        tracked_papers = await self._fetch_papers_by_ids(tracked_paper_ids)
+        metadata_by_id = self._normalize_tracked_metadata(tracked_metadata or {})
+        tracked_paper_fetch = await self._fetch_papers_by_ids(tracked_paper_ids)
         publication_updates: List[Paper] = []
         loop = asyncio.get_event_loop()
+        crossref_stats = {"requests": 0}
+        crossref_fallback_attempts = 0
+        crossref_fallback_skips = 0
 
-        for paper in tracked_papers:
+        if tracked_paper_fetch.failed_ids:
+            refreshed_count = len(tracked_paper_fetch.requested_ids) - len(tracked_paper_fetch.failed_ids)
+            self.logger.warning(
+                "Publication metadata refresh completed with gaps: refreshed %d/%d tracked papers; "
+                "%d could not be checked this run.",
+                refreshed_count,
+                len(tracked_paper_fetch.requested_ids),
+                len(tracked_paper_fetch.failed_ids),
+            )
+
+        for paper in tracked_paper_fetch.papers:
             # If arXiv itself already exposes publication metadata, prefer that
             # over any external inference.
             if paper.journal_ref or paper.doi:
-                enriched = await self.enrich_publication_metadata(paper)
+                enriched = await self.enrich_publication_metadata(paper, crossref_stats=crossref_stats)
                 publication_updates.append(enriched._replace(announce_type='published_metadata'))
                 continue
 
             # Crossref is only consulted for papers that still look unpublished
             # on arXiv, which helps keep false positives low.
+            crossref_stats["requests"] += 1
             crossref_match = await loop.run_in_executor(None, self._find_crossref_publication, paper)
             if crossref_match:
                 publication_updates.append(crossref_match)
 
-        return publication_updates
+        for failed_id in tracked_paper_fetch.failed_ids:
+            stored_metadata = metadata_by_id.get(failed_id)
+            if stored_metadata is None:
+                crossref_fallback_skips += 1
+                continue
 
-    async def enrich_publication_metadata(self, paper: Paper) -> Paper:
+            crossref_fallback_attempts += 1
+            crossref_match = await self._crossref_fallback_for_failed_refresh(
+                failed_id,
+                stored_metadata,
+                crossref_stats=crossref_stats,
+            )
+            if crossref_match:
+                publication_updates.append(crossref_match)
+
+        checked_ids = [
+            paper.id
+            for paper in tracked_paper_fetch.papers
+        ]
+        if tracked_paper_fetch.failed_ids or crossref_stats["requests"]:
+            suffix = ""
+            if crossref_fallback_skips:
+                suffix = (
+                    f"; {crossref_fallback_skips} failed arXiv refreshes lacked enough "
+                    "stored metadata for Crossref fallback"
+                )
+            self.logger.info(
+                "Publication update Crossref summary: %d requests issued; "
+                "Crossref-only fallback attempted for %d failed arXiv refreshes%s.",
+                crossref_stats["requests"],
+                crossref_fallback_attempts,
+                suffix,
+            )
+        return PublicationRefreshResult(
+            updates=publication_updates,
+            checked_ids=checked_ids,
+            failed_ids=tracked_paper_fetch.failed_ids,
+            degraded=tracked_paper_fetch.degraded,
+        )
+
+    async def enrich_publication_metadata(
+        self,
+        paper: Paper,
+        crossref_stats: Optional[Dict[str, int]] = None,
+    ) -> Paper:
         """Normalizes journal metadata and upgrades sparse refs when Crossref can help."""
         # Normalize first so later checks do not have to care about blank strings
         # versus None when deciding whether metadata is actually present.
@@ -162,6 +250,8 @@ class ArxivFetcher:
         if normalized_paper.doi:
             # A DOI is the strongest key Crossref offers, so try that before any
             # fuzzier title/author matching.
+            if crossref_stats is not None:
+                crossref_stats["requests"] = crossref_stats.get("requests", 0) + 1
             crossref_item = await loop.run_in_executor(None, self._fetch_crossref_work_by_doi, normalized_paper.doi)
             if crossref_item:
                 enriched = self._paper_from_crossref_item(
@@ -175,11 +265,76 @@ class ArxivFetcher:
         if self._journal_ref_needs_enrichment(normalized_paper.journal_ref):
             # Fall back to a conservative search only when the existing journal
             # reference looks too sparse to be useful in Discord messages.
+            if crossref_stats is not None:
+                crossref_stats["requests"] = crossref_stats.get("requests", 0) + 1
             crossref_match = await loop.run_in_executor(None, self._find_crossref_publication, normalized_paper)
             if crossref_match:
                 return crossref_match
 
         return normalized_paper
+
+    async def _crossref_fallback_for_failed_refresh(
+        self,
+        paper_id: str,
+        metadata: TrackedPaperMetadata,
+        crossref_stats: Optional[Dict[str, int]] = None,
+    ) -> Optional[Paper]:
+        """Uses stored local metadata to query Crossref when arXiv refresh could not run."""
+        fallback_paper = self._paper_from_tracked_metadata(paper_id, metadata)
+        if fallback_paper is None:
+            return None
+
+        if fallback_paper.doi or fallback_paper.journal_ref:
+            enriched = await self.enrich_publication_metadata(fallback_paper, crossref_stats=crossref_stats)
+            if enriched.doi or enriched.journal_ref:
+                return enriched._replace(announce_type='crossref_registry_fallback')
+            return None
+
+        loop = asyncio.get_event_loop()
+        if crossref_stats is not None:
+            crossref_stats["requests"] = crossref_stats.get("requests", 0) + 1
+        return await loop.run_in_executor(None, self._find_crossref_publication, fallback_paper)
+
+    def _normalize_tracked_metadata(
+        self,
+        tracked_metadata: Dict[str, TrackedPaperMetadata],
+    ) -> Dict[str, TrackedPaperMetadata]:
+        """Canonicalizes tracked-paper metadata keys so they match normalized arXiv IDs."""
+        normalized: Dict[str, TrackedPaperMetadata] = {}
+        for paper_id, metadata in tracked_metadata.items():
+            normalized[canonicalize_paper_id(paper_id)] = TrackedPaperMetadata(
+                title=self._clean_optional_text(metadata.title),
+                authors=[
+                    author.strip()
+                    for author in metadata.authors
+                    if isinstance(author, str) and author.strip()
+                ],
+                doi=self._clean_optional_text(metadata.doi),
+                journal_ref=self._clean_optional_text(metadata.journal_ref),
+            )
+        return normalized
+
+    def _paper_from_tracked_metadata(
+        self,
+        paper_id: str,
+        metadata: TrackedPaperMetadata,
+    ) -> Optional[Paper]:
+        """Builds a synthetic Paper from locally stored metadata for Crossref fallback."""
+        if not metadata.doi and (not metadata.title or not metadata.authors):
+            return None
+
+        return Paper(
+            id=paper_id,
+            title=metadata.title or f"arXiv:{paper_id}",
+            authors=list(metadata.authors),
+            published=datetime.now(ZoneInfo("UTC")),
+            summary="",
+            link=f"https://arxiv.org/abs/{paper_id}",
+            pdf_link=f"https://arxiv.org/pdf/{paper_id}",
+            doi=metadata.doi,
+            journal_ref=metadata.journal_ref,
+            announce_type='crossref_registry_seed',
+        )
 
     async def _fetch_from_api(self, last_submission_date: datetime) -> List[Paper]:
         """
@@ -305,7 +460,7 @@ class ArxivFetcher:
         normalized_papers = [self._normalize_api_result(result) for result in unique_results]
         return normalized_papers
 
-    async def _fetch_papers_by_ids(self, paper_ids: List[str]) -> List[Paper]:
+    async def _fetch_papers_by_ids(self, paper_ids: List[str]) -> FetchPapersByIdResult:
         """Fetches specific arXiv papers by ID to refresh their metadata."""
         normalized_ids: List[str] = []
         seen_ids = set()
@@ -317,12 +472,14 @@ class ArxivFetcher:
             normalized_ids.append(canonical_id)
 
         if not normalized_ids:
-            return []
+            return FetchPapersByIdResult(papers=[], requested_ids=[], failed_ids=[], degraded=False)
 
         loop = asyncio.get_event_loop()
         # Rebuild results in the original order later so the caller gets stable,
         # predictable processing independent of API response order.
         papers_by_id: Dict[str, Paper] = {}
+        failed_ids: List[str] = []
+        degraded = False
         chunk_size = 50
         id_chunks = [
             normalized_ids[i:i + chunk_size]
@@ -336,24 +493,141 @@ class ArxivFetcher:
             )
             search = arxiv.Search(id_list=id_chunk, max_results=len(id_chunk))
 
-            try:
-                results_iterator = self.arxiv_client.results(search)
-                chunk_results = await loop.run_in_executor(None, list, results_iterator)
-            except Exception as e:
-                self.logger.error(
-                    f"Error refreshing tracked paper metadata for chunk {index}/{len(id_chunks)}: {e}",
-                    exc_info=True,
-                )
+            chunk_results = []
+            chunk_succeeded = False
+            for attempt, backoff_seconds in enumerate((0, *TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS), start=1):
+                try:
+                    results_iterator = self.arxiv_client.results(search)
+                    chunk_results = await loop.run_in_executor(None, list, results_iterator)
+                    chunk_succeeded = True
+                    break
+                except Exception as e:
+                    retryable = self._is_retryable_arxiv_error(e)
+                    is_last_attempt = attempt == len(TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS) + 1
+
+                    if retryable and not is_last_attempt:
+                        self.logger.warning(
+                            "Transient arXiv error while refreshing tracked papers for chunk %d/%d "
+                            "(attempt %d/%d): %s. Cooling down for %d seconds before retrying.",
+                            index,
+                            len(id_chunks),
+                            attempt,
+                            len(TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS) + 1,
+                            self._summarize_exception(e),
+                            backoff_seconds,
+                        )
+                        await asyncio.sleep(backoff_seconds)
+                        continue
+
+                    degraded = True
+                    failed_ids.extend(id_chunk)
+                    log_method = self.logger.warning if retryable else self.logger.error
+                    log_method(
+                        "Could not refresh tracked-paper metadata for chunk %d/%d after %d attempt(s). "
+                        "Skipping %d tracked papers for this run. Error: %s",
+                        index,
+                        len(id_chunks),
+                        attempt,
+                        len(id_chunk),
+                        self._summarize_exception(e),
+                        exc_info=True,
+                    )
+
+                    if retryable and index < len(id_chunks):
+                        remaining_ids = [
+                            paper_id
+                            for remaining_chunk in id_chunks[index:]
+                            for paper_id in remaining_chunk
+                        ]
+                        failed_ids.extend(remaining_ids)
+                        self.logger.warning(
+                            "Aborting the remaining %d tracked-paper refresh chunk(s) for this run "
+                            "to avoid hammering the arXiv API.",
+                            len(id_chunks) - index,
+                        )
+                        return FetchPapersByIdResult(
+                            papers=[papers_by_id[paper_id] for paper_id in normalized_ids if paper_id in papers_by_id],
+                            requested_ids=normalized_ids,
+                            failed_ids=self._dedupe_preserving_order(failed_ids),
+                            degraded=True,
+                        )
+                    break
+
+            if not chunk_succeeded:
                 continue
 
             for result in chunk_results:
                 paper = self._normalize_api_result(result)
                 papers_by_id[paper.id] = paper
 
+            missing_ids = [
+                paper_id
+                for paper_id in id_chunk
+                if paper_id not in papers_by_id
+            ]
+            if missing_ids:
+                degraded = True
+                failed_ids.extend(missing_ids)
+                self.logger.warning(
+                    "arXiv returned metadata for %d/%d tracked papers in chunk %d/%d. "
+                    "Missing IDs: %s",
+                    len(id_chunk) - len(missing_ids),
+                    len(id_chunk),
+                    index,
+                    len(id_chunks),
+                    ", ".join(missing_ids[:5]) + (" ..." if len(missing_ids) > 5 else ""),
+                )
+
             if index < len(id_chunks):
                 await asyncio.sleep(3)
 
-        return [papers_by_id[paper_id] for paper_id in normalized_ids if paper_id in papers_by_id]
+        return FetchPapersByIdResult(
+            papers=[papers_by_id[paper_id] for paper_id in normalized_ids if paper_id in papers_by_id],
+            requested_ids=normalized_ids,
+            failed_ids=self._dedupe_preserving_order(failed_ids),
+            degraded=degraded,
+        )
+
+    def _extract_http_status_code(self, error: Exception) -> Optional[int]:
+        """Extracts an HTTP status code from an arxiv.py exception message when present."""
+        match = HTTP_STATUS_PATTERN.search(str(error))
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _is_retryable_arxiv_error(self, error: Exception) -> bool:
+        """Returns True for transient arXiv API failures worth retrying later."""
+        status_code = self._extract_http_status_code(error)
+        if status_code in TRANSIENT_ARXIV_STATUS_CODES:
+            return True
+
+        error_text = str(error).lower()
+        transient_markers = (
+            "timed out",
+            "temporarily unavailable",
+            "connection aborted",
+            "connection reset",
+            "remote end closed connection",
+        )
+        return any(marker in error_text for marker in transient_markers)
+
+    def _summarize_exception(self, error: Exception) -> str:
+        """Builds a short one-line summary for logs without dropping the traceback."""
+        status_code = self._extract_http_status_code(error)
+        if status_code is not None:
+            return f"HTTP {status_code}"
+        return f"{type(error).__name__}: {error}"
+
+    def _dedupe_preserving_order(self, values: List[str]) -> List[str]:
+        """Removes duplicates from a list while preserving the original order."""
+        seen = set()
+        deduped: List[str] = []
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            deduped.append(value)
+        return deduped
 
     def _fetch_from_rss(self) -> List[Paper]:
         """

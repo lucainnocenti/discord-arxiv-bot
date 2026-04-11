@@ -10,7 +10,7 @@ import argparse
 import asyncio
 import logging
 
-from arxiv_fetcher import ArxivFetcher
+from arxiv_fetcher import ArxivFetcher, TrackedPaperMetadata
 from bot import setup_logging
 from settings import load_settings
 from state_manager import StateManager
@@ -49,7 +49,19 @@ async def backfill_published_registry():
         print("No tracked unpublished papers found.")
         return
 
-    publication_updates = await fetcher.fetch_publication_updates(candidate_ids)
+    publication_updates = await fetcher.fetch_publication_updates(
+        candidate_ids,
+        tracked_metadata={
+            paper_id: TrackedPaperMetadata(
+                title=record.title,
+                authors=list(record.authors),
+                doi=record.doi,
+                journal_ref=record.journal_ref,
+            )
+            for paper_id, record in registry.items()
+            if paper_id in candidate_ids
+        },
+    )
 
     updated_count = 0
     skipped_without_doi = 0
@@ -67,6 +79,8 @@ async def backfill_published_registry():
             published=True,
             doi=paper.doi,
             journal_ref=paper.journal_ref,
+            title=paper.title,
+            authors=paper.authors,
         )
         updated_count += 1
 
