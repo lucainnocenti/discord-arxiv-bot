@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 from arxiv_fetcher import Paper
 from settings import AppSettings
+from utils import find_matching_target_authors
 
 MAX_SUMMARY_LEN = 1400
 MAX_DISCORD_MSG_LEN = 2000
@@ -110,25 +111,12 @@ def _build_target_authors_string(
     author_discord_ids: Dict[str, int],
 ) -> str:
     """Constructs a tagged string of target authors found in the paper."""
-    # Match against the configured author list first, then replace matched names
-    # with Discord mentions when an ID is available.
-    target_in_paper: List[str] = []
-    paper_authors_lower = {p.lower() for p in paper_authors}
-    for target in target_authors:
-        if target.lower() in paper_authors_lower:
-            target_in_paper.append(target)
+    # Resolve paper authors back to the canonical configured names so initial-
+    # based variants still mention the intended tracked author once.
+    target_in_paper = find_matching_target_authors(paper_authors, target_authors)
 
     if not target_in_paper:
         return "tracked authors"
-
-    if paper_authors:
-        # Put the first matching author first in the mention string so the alert
-        # reads naturally when a tracked author leads the paper.
-        first_author_lower = paper_authors[0].lower()
-        for i, target in enumerate(target_in_paper):
-            if target.lower() == first_author_lower:
-                target_in_paper.insert(0, target_in_paper.pop(i))
-                break
 
     tagged_authors: List[str] = []
     for author in target_in_paper:

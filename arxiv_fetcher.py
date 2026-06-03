@@ -20,7 +20,7 @@ from typing import List, Dict, Any, NamedTuple, Optional, cast, Tuple # For type
 
 # Import settings and utilities from other modules in the project
 from settings import AppSettings, API_SOURCE, RSS_SOURCE
-from utils import decode_author_name
+from utils import decode_author_name, find_matching_target_authors
 
 # Define a standard structure for paper data returned by the fetcher.
 # Using NamedTuple provides immutability and dot-notation access.
@@ -703,12 +703,7 @@ class ArxivFetcher:
         Returns:
             True if there is at least one match, False otherwise.
         """
-        # Convert target authors to lowercase set for efficient lookup
-        target_authors_lower = {ta.lower() for ta in self.settings.target_authors}
-        # Convert paper authors to lowercase set
-        paper_authors_lower = {pa.lower() for pa in paper_authors}
-        # Check if the intersection of the two sets is non-empty
-        return not target_authors_lower.isdisjoint(paper_authors_lower)
+        return bool(find_matching_target_authors(paper_authors, self.settings.target_authors))
 
     def _normalize_api_result(self, result: arxiv.Result) -> Paper:
         """

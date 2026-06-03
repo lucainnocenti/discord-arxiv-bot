@@ -111,6 +111,51 @@ class PublicationTrackingTests(unittest.TestCase):
             self.assertIn("New journal reference", message)
             self.assertIn("Journal of Tests", message)
 
+    def test_is_author_match_accepts_middle_initial_variants(self):
+        with workspace_tempdir() as tmpdir:
+            settings = AppSettings(
+                discord_token="token",
+                channel_id=1,
+                test_channel_id=2,
+                target_authors=[
+                    "Marcel Augusto Pinto",
+                    "M. Augusto Pinto",
+                    "M Augusto Pinto",
+                ],
+                author_discord_ids={"Marcel Augusto Pinto": 54321},
+                script_dir=tmpdir,
+            )
+            fetcher = ArxivFetcher(settings)
+
+            self.assertTrue(fetcher._is_author_match(["Marcel A. Pinto", "Coauthor Example"]))
+
+    def test_format_message_mentions_canonical_author_for_initial_variant(self):
+        with workspace_tempdir() as tmpdir:
+            settings = AppSettings(
+                discord_token="token",
+                channel_id=1,
+                test_channel_id=2,
+                target_authors=[
+                    "Marcel Augusto Pinto",
+                    "M. Augusto Pinto",
+                    "M Augusto Pinto",
+                ],
+                author_discord_ids={
+                    "Marcel Augusto Pinto": 54321,
+                    "M. Augusto Pinto": 54321,
+                    "M Augusto Pinto": 54321,
+                },
+                script_dir=tmpdir,
+            )
+            paper = make_paper(authors=["Marcel A. Pinto", "Bob Example"])
+
+            message = format_paper_message(paper, settings)
+
+            self.assertIsNotNone(message)
+            self.assertIn("**New paper by <@54321>**", message)
+            self.assertNotIn("tracked authors", message)
+            self.assertEqual(message.count("<@54321>"), 1)
+
     def test_crossref_match_requires_close_title_and_author(self):
         with workspace_tempdir() as tmpdir:
             settings = make_settings(tmpdir)
