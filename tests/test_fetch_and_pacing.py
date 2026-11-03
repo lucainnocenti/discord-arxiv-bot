@@ -6,15 +6,17 @@ import socket
 import unittest
 import urllib.error
 from datetime import date, datetime, timedelta, timezone
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import arxiv_source
 import crossref
 from arxiv_source import ArxivSource
 from crossref import CrossrefClient
-from rss_source import RssFeed, parse_feed, read_last_covered, rss_url, write_last_covered
+from rss_source import RssFeed, parse_feed, rss_url
 from run_lock import LockHeldElsewhere, run_lock
 from tests.test_publication_tracking import make_paper, make_settings, workspace_tempdir
+from utils import read_date, write_date
 
 
 TUESDAY, MONDAY, FRIDAY, THURSDAY = date(2026, 11, 3), date(2026, 11, 2), date(2026, 10, 30), date(2026, 10, 29)
@@ -27,7 +29,7 @@ class RecentPapersTests(unittest.TestCase):
         with workspace_tempdir() as tmpdir:
             source = ArxivSource(make_settings(tmpdir, **overrides))
             if last_covered:
-                write_last_covered(source.settings.rss_coverage_file, last_covered)
+                write_date(source.settings.rss_coverage_file, last_covered)
             seen_since = []
 
             async def fake_api(since):
@@ -37,9 +39,10 @@ class RecentPapersTests(unittest.TestCase):
             source._search_since = fake_api  # type: ignore[method-assign]
             rss = dict(side_effect=OSError("down")) if feed_error else dict(return_value=feed)
             with patch.object(arxiv_source, "fetch_rss_feed", **rss):
-                papers = asyncio.run(source.search_recent())
-            source.commit_coverage()
-            covered = read_last_covered(source.settings.rss_coverage_file)
+                papers, covered_day = asyncio.run(source.search_recent())
+            if covered_day:
+                source.record_coverage(covered_day)
+            covered = read_date(source.settings.rss_coverage_file)
         return [p.id for p in papers], seen_since, covered
 
     def test_consecutive_announcement_uses_only_the_feed(self):
@@ -136,6 +139,40 @@ class RecentPapersTests(unittest.TestCase):
         self.assertEqual(covered, MONDAY)
 
 
+def api_result(paper_id, day):
+    return SimpleNamespace(
+        entry_id=f"http://arxiv.org/abs/{paper_id}v1", title="T", authors=[SimpleNamespace(name="Alice Example")],
+        published=datetime(2026, 11, day, tzinfo=timezone.utc), summary="S", doi=None, journal_ref=None,
+        get_short_id=lambda: f"{paper_id}v1",
+    )
+
+
+class ApiSearchTests(unittest.TestCase):
+    AUTHORS = [f"Author{n} Example" for n in range(25)]  # two query chunks
+
+    def search(self, *chunk_results):
+        with workspace_tempdir() as tmpdir:
+            source = ArxivSource(make_settings(tmpdir, target_authors=self.AUTHORS))
+            with patch.object(source.client, "results", side_effect=list(chunk_results)) as results, \
+                    patch("arxiv_source.asyncio.sleep", new=AsyncMock()):
+                papers, complete = asyncio.run(source._search_since(datetime(2026, 11, 1, tzinfo=timezone.utc)))
+        return [p.id for p in papers], complete, results.call_count
+
+    def test_chunks_are_merged_deduplicated_and_sorted(self):
+        ids, complete, calls = self.search(
+            [api_result("2611.00002", 2), api_result("2611.00001", 1)],
+            [api_result("2611.00001", 1), api_result("2611.00003", 3)],
+        )
+        self.assertEqual(ids, ["2611.00001", "2611.00002", "2611.00003"])
+        self.assertTrue(complete)
+        self.assertEqual(calls, 2)
+
+    def test_failed_chunk_returns_what_was_found_as_incomplete(self):
+        ids, complete, _ = self.search([api_result("2611.00001", 1)], Exception("HTTP 400"))
+        self.assertEqual(ids, ["2611.00001"])
+        self.assertFalse(complete)
+
+
 RSS_FEED = b"""<?xml version='1.0' encoding='UTF-8'?>
 <rss xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0"><channel>
 <pubDate>Tue, 03 Nov 2026 00:00:00 -0500</pubDate>
@@ -177,7 +214,6 @@ class RssParsingTests(unittest.TestCase):
         self.assertEqual(paper.authors, ["Alice Example", "José Martín"])
         self.assertEqual(paper.summary, "An abstract.")
         self.assertEqual(paper.doi, "10.1/x")
-        self.assertEqual(paper.announce_type, "rss_new")
 
     def test_empty_feed_gives_no_papers(self):
         feed = parse_feed(b"<rss version='2.0'><channel><pubDate>Tue, 03 Nov 2026 00:00:00 -0500</pubDate></channel></rss>")

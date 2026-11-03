@@ -2,10 +2,10 @@ import asyncio
 import contextlib
 import io
 import unittest
+from datetime import date
 from unittest.mock import AsyncMock, MagicMock
 
 import manage
-from models import PublicationRefreshResult
 from pipeline import Pipeline
 from registry import PaperRegistry
 from tests.test_publication_tracking import make_paper, make_settings, workspace_tempdir
@@ -21,16 +21,17 @@ class FakeSender:
         return self.succeed
 
 
+ANNOUNCED = date(2026, 11, 3)
+
+
 def make_pipeline(tmpdir, *, new_papers=(), updates=(), succeed=True, **settings_overrides):
     settings = make_settings(tmpdir, **settings_overrides)
     registry = PaperRegistry.load(settings.posted_papers_file, read_only=settings.no_save)
     arxiv_source = MagicMock()
-    arxiv_source.search_recent = AsyncMock(return_value=list(new_papers))
+    arxiv_source.search_recent = AsyncMock(return_value=(list(new_papers), ANNOUNCED))
     publications = MagicMock()
     publications.enrich = AsyncMock(side_effect=lambda paper: paper)
-    publications.find_updates = AsyncMock(return_value=PublicationRefreshResult(
-        updates=list(updates), checked_ids=[p.id for p in updates], failed_ids=[], degraded=False,
-    ))
+    publications.find_updates = AsyncMock(return_value=list(updates))
     sender = FakeSender(succeed)
     return Pipeline(settings, registry, arxiv_source, publications, sender), sender
 
@@ -64,20 +65,20 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(summary.papers_posted, 0)
             self.assertFalse(pipeline.registry.get("2611.00001").posted)
             # The announcement stays unprocessed, so the next run's API search retries it.
-            pipeline.arxiv.commit_coverage.assert_not_called()
+            pipeline.arxiv.record_coverage.assert_not_called()
 
     def test_announcement_is_recorded_once_everything_was_sent(self):
         with workspace_tempdir() as tmpdir:
             pipeline, _ = make_pipeline(tmpdir, new_papers=[make_paper(id="2611.00001")])
             asyncio.run(pipeline.run())
-            pipeline.arxiv.commit_coverage.assert_called_once()
+            pipeline.arxiv.record_coverage.assert_called_once_with(ANNOUNCED)
 
     def test_unformattable_paper_does_not_block_recording(self):
         with workspace_tempdir() as tmpdir:
             pipeline, sender = make_pipeline(tmpdir, new_papers=[make_paper(id="2611.00001", title="x" * 2100)])
             asyncio.run(pipeline.run())
             self.assertEqual(sender.messages, [])
-            pipeline.arxiv.commit_coverage.assert_called_once()
+            pipeline.arxiv.record_coverage.assert_called_once_with(ANNOUNCED)
 
     def test_no_send_dry_run_sends_and_records_nothing(self):
         with workspace_tempdir() as tmpdir:
@@ -86,7 +87,7 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(sender.messages, [])
             self.assertNotIn("2611.00001", pipeline.registry)
-            pipeline.arxiv.commit_coverage.assert_not_called()
+            pipeline.arxiv.record_coverage.assert_not_called()
 
     def test_publication_update_is_announced_once(self):
         with workspace_tempdir() as tmpdir:
@@ -98,6 +99,16 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(summary.publication_updates, 1)
             self.assertIn("was published", sender.messages[0])
             self.assertTrue(PaperRegistry.load(pipeline.settings.posted_papers_file).get("2610.00001").published)
+
+    def test_publication_check_runs_even_when_fetching_new_papers_fails(self):
+        with workspace_tempdir() as tmpdir:
+            pipeline, _ = make_pipeline(tmpdir)
+            pipeline.arxiv.search_recent.side_effect = OSError("arXiv down")
+            pipeline.registry.update("2610.00001", posted=True, title="Old", authors=["Alice Example"])
+            asyncio.run(pipeline.run())
+
+            pipeline.publications.find_updates.assert_awaited_once()
+            pipeline.arxiv.record_coverage.assert_not_called()
 
 
 class ManageCommandTests(unittest.TestCase):

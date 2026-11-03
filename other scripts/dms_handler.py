@@ -1,8 +1,16 @@
-"""Small Discord utility bot for channel creation commands and DM forwarding."""
+"""Small Discord utility bot for channel creation commands and DM forwarding.
+
+Separate from the paper bot; it only shares config.py, one folder up.
+"""
 
 import logging
+import os
+import sys
+
 import discord
 from discord.ext import commands
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 DISCORD_TOKEN = config.DISCORD_TOKEN

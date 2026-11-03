@@ -94,7 +94,7 @@ class CrossrefClient:
         if not crossref_title or not is_probable_match(paper, crossref_title, item.get("author", [])):
             return None
 
-        return merge_crossref_item(paper, item, announce_type='crossref_published')
+        return merge_crossref_item(paper, item)
 
     def _get_json(self, url: str) -> Any:
         """
@@ -157,13 +157,13 @@ def is_probable_match(paper: Paper, crossref_title: str, crossref_authors: Any) 
     return first_author_family in candidate_families
 
 
-def merge_crossref_item(paper: Paper, item: Dict[str, Any], *, announce_type: str) -> Optional[Paper]:
+def merge_crossref_item(paper: Paper, item: Dict[str, Any]) -> Optional[Paper]:
     """Returns `paper` with the best DOI and journal reference from a Crossref work."""
     doi = clean_optional_text(item.get("DOI")) or paper.doi
     journal_ref = choose_better_journal_ref(paper.journal_ref, format_journal_ref(item))
     if not doi and not journal_ref:
         return None
-    return paper._replace(doi=doi, journal_ref=journal_ref, announce_type=announce_type)
+    return paper._replace(doi=doi, journal_ref=journal_ref)
 
 
 def format_journal_ref(item: Dict[str, Any]) -> Optional[str]:

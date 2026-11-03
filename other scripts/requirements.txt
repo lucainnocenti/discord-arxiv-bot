@@ -1,0 +1,2 @@
+# For dms_handler.py and fetch_channel_members_id.py (not needed by the paper bot).
+discord.py==2.6.3

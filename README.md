@@ -79,14 +79,19 @@ Don't edit the registry while the bot is running.
 |---|---|
 | `bot.py` | Entry point: logging, run lock, member sync, then the pipeline |
 | `pipeline.py` | One run's logic; posts through a `send` function |
-| `arxiv_source.py` | Finds new papers (RSS feed first, API search for gaps); refreshes known papers by ID |
-| `rss_source.py` | Parses the RSS feed of the latest announcement; tracks the last one processed |
+| `arxiv_source.py` | Finds new papers (RSS feed first, API search for gaps), tracks the last announcement processed; refreshes known papers by ID |
+| `rss_source.py` | Parses the RSS feed of the latest announcement |
 | `publication_check.py` | Decides whether tracked papers are now published |
 | `crossref.py` | Paced Crossref client, matching rules, citation formatting |
 | `registry.py` | The paper registry (load once, save atomically) |
 | `discord_formatter.py` / `discord_webhook.py` | Message text / delivery |
-| `member_sync.py`, `tracked_authors.py` | Website member sync, author list |
-| `dms_handler.py` | Separate Discord bot for DM forwarding and channel commands |
+| `tracked_authors.py` | Author list and author-name matching |
+| `member_sync.py` | Website member sync |
+| `notifier.py`, `utils.py` | Telegram messages; the one-date state files |
+
+`other scripts/` holds unrelated helpers, such as `dms_handler.py`, a separate
+Discord bot for DM forwarding and channel commands. Their extra dependencies
+are in `other scripts/requirements.txt`.
 
 Run the tests with `python -m pytest`.
 

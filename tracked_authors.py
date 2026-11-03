@@ -5,18 +5,20 @@ hand and extended automatically by the website member sync. Each entry records
 where it came from (`manual` or `website`) so auto-added names can be
 reviewed, plus optional extra spellings and a Discord user ID for mentions.
 
-Only full names and explicit variations are needed: the matcher in utils.py
+Only full names and explicit variations are needed: the matcher below
 already accepts initials ("F. Last") and middle names for every entry.
 """
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from typing import Dict, List, Optional
 
 MANUAL_SOURCE = "manual"
 WEBSITE_SOURCE = "website"
+AUTHOR_TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
 
 
 @dataclass
@@ -83,7 +85,7 @@ def save_tracked_authors(path: str, tracked: TrackedAuthorList):
 
 def author_name_variants(author: TrackedAuthor) -> List[str]:
     """Returns the canonical name followed by any extra spellings."""
-    return _dedupe([author.name, *author.variations])
+    return list(dict.fromkeys([author.name, *author.variations]))
 
 
 def expand_target_names(tracked: TrackedAuthorList) -> List[str]:
@@ -91,7 +93,7 @@ def expand_target_names(tracked: TrackedAuthorList) -> List[str]:
     names: List[str] = []
     for author in tracked.authors:
         names.extend(author_name_variants(author))
-    return _dedupe(names)
+    return list(dict.fromkeys(names))
 
 
 def expand_discord_ids(tracked: TrackedAuthorList) -> Dict[str, int]:
@@ -114,11 +116,44 @@ def new_website_author(name: str, slug: Optional[str], group: Optional[str]) -> 
     )
 
 
-def _dedupe(values: List[str]) -> List[str]:
-    seen = set()
-    result = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            result.append(value)
-    return result
+def author_names_match(left: str, right: str) -> bool:
+    """Matches author names across common initial and middle-name variations."""
+    left_clean = left.strip().casefold()
+    right_clean = right.strip().casefold()
+    if not left_clean or not right_clean:
+        return False
+    if left_clean == right_clean:
+        return True
+
+    left_tokens = AUTHOR_TOKEN_PATTERN.findall(left_clean)
+    right_tokens = AUTHOR_TOKEN_PATTERN.findall(right_clean)
+    if len(left_tokens) < 2 or len(right_tokens) < 2:
+        return False
+
+    if left_tokens[-1] != right_tokens[-1]:
+        return False
+
+    # Compares first and middle names pairwise; surplus middle names on
+    # either side are ignored.
+    return all(
+        _author_tokens_compatible(left_token, right_token)
+        for left_token, right_token in zip(left_tokens[:-1], right_tokens[:-1])
+    )
+
+
+def find_matching_target_authors(paper_authors: List[str], target_authors: List[str]) -> List[str]:
+    """Returns canonical configured target authors found in the paper author list."""
+    matched_targets: List[str] = []
+    for paper_author in paper_authors:
+        for target_author in target_authors:
+            if target_author not in matched_targets and author_names_match(paper_author, target_author):
+                matched_targets.append(target_author)
+                break
+    return matched_targets
+
+
+def _author_tokens_compatible(left: str, right: str) -> bool:
+    # `left` is the paper author and `right` is the configured target author.
+    # Initials in the paper can match full configured names, but a configured
+    # initial-only alias should not match a different full first name.
+    return left == right or (len(left) == 1 and right.startswith(left))

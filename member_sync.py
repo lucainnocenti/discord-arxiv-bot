@@ -8,9 +8,8 @@ leave the group stay tracked, and names in `ignored_website_names` are skipped.
 """
 
 import logging
-import os
 import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from html.parser import HTMLParser
 from typing import List, NamedTuple, Optional
 
@@ -19,11 +18,12 @@ from settings import AppSettings
 from tracked_authors import (
     TrackedAuthorList,
     expand_target_names,
+    find_matching_target_authors,
     load_tracked_authors,
     new_website_author,
     save_tracked_authors,
 )
-from utils import find_matching_target_authors
+from utils import read_date, write_date
 
 MEMBER_SYNC_INTERVAL = timedelta(days=7)
 # Former members are listed as plain names, not cards, but skip the section
@@ -120,7 +120,7 @@ def find_untracked_members(members: List[WebsiteMember], tracked: TrackedAuthorL
 def is_member_sync_due(settings: AppSettings) -> bool:
     if settings.force_member_sync:
         return True
-    last_sync = _read_last_sync_date(settings.last_member_sync_file)
+    last_sync = read_date(settings.last_member_sync_file)
     if last_sync is None:
         return True
     return date.today() - last_sync >= MEMBER_SYNC_INTERVAL
@@ -167,31 +167,15 @@ def sync_members_from_website(settings: AppSettings) -> List[str]:
         save_tracked_authors(settings.tracked_authors_file, tracked)
         _notify_new_authors(settings, untracked)
 
-    _write_last_sync_date(settings.last_member_sync_file)
+    write_date(settings.last_member_sync_file, date.today())
     return [member.name for member in untracked]
 
 
 def _notify_new_authors(settings: AppSettings, added: List[WebsiteMember]):
-    lines = [f"arxiv-bot: added {len(added)} new tracked author(s) from {settings.members_page_url}"]
+    lines = [f"added {len(added)} new tracked author(s) from {settings.members_page_url}"]
     lines += [f"- {member.name} ({member.group or 'unknown role'})" for member in added]
     lines.append("Check their arXiv name forms in tracked_authors.json.")
     send_telegram_message(settings, "\n".join(lines))
-
-
-def _read_last_sync_date(path: str) -> Optional[date]:
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return datetime.fromisoformat(f.read().strip()).date()
-    except Exception as e:
-        logger.warning(f"Could not read last member sync date from {path}: {e}")
-        return None
-
-
-def _write_last_sync_date(path: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(date.today().isoformat())
 
 
 def _slug_from_href(href: Optional[str]) -> Optional[str]:

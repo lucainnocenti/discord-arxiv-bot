@@ -2,6 +2,7 @@
 
 import json
 import logging
+import socket
 import urllib.request
 
 logger = logging.getLogger("Notifier")
@@ -12,6 +13,8 @@ def send_telegram_message(settings, text: str) -> bool:
     if not settings.telegram_bot_token or not settings.telegram_chat_id:
         logger.info("Telegram not configured; skipping notification.")
         return False
+    # Name the machine: the bot runs on several.
+    text = f"arxiv-bot on {socket.gethostname()}: {text}"
     if settings.no_send:
         logger.info(f"[NO_SEND] Would send Telegram message:\n{text}")
         return False

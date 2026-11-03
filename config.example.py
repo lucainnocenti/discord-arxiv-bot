@@ -19,7 +19,7 @@ MEMBERS_PAGE_URL = None
 TELEGRAM_BOT_TOKEN = None
 TELEGRAM_CHAT_ID = None
 
-# --- DM forwarding and channel commands (dms_handler.py) ---
+# --- DM forwarding and channel commands (other scripts/dms_handler.py) ---
 DISCORD_TOKEN = "bot token from the Discord developer portal"
 DMS_GUILD_ID = 0             # server where the slash commands are registered
 DMS_FORWARD_TO_USER_ID = 0   # user who receives DMs sent to the bot

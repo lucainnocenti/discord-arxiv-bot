@@ -10,9 +10,9 @@ import json
 import logging
 import os
 from dataclasses import asdict, dataclass, field, replace
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from models import Paper, canonicalize_paper_id
+from models import Paper, canonicalize_paper_id, clean_optional_text
 
 logger = logging.getLogger("PaperRegistry")
 
@@ -43,23 +43,24 @@ class PaperRegistry:
         unreadable file raises, because carrying on with an empty registry
         would re-announce every paper in the fetch window.
         """
-        records: Dict[str, PaperRecord] = {}
+        registry = cls(path, read_only=read_only)
         if not os.path.exists(path):
             logger.info(f"{path} not found. Starting with an empty registry.")
-            return cls(path, records, read_only=read_only)
+            return registry
 
         with open(path, "r", encoding="utf-8") as f:
             for raw_line in f:
                 line = raw_line.strip()
                 if not line:
                     continue
-                paper_id, record = _parse_line(line)
-                if paper_id:
-                    # Merge duplicate lines defensively so repeated writes or
+                parsed = _parse_line(line)
+                if parsed:
+                    # update() merges duplicate lines, so repeated writes or
                     # manual edits do not lose information.
-                    records[paper_id] = _merge(records.get(paper_id, PaperRecord()), record)
-        logger.info(f"Loaded {len(records)} tracked paper records from {path}")
-        return cls(path, records, read_only=read_only)
+                    registry.update(parsed.pop("id"), **parsed)
+        registry._dirty = False
+        logger.info(f"Loaded {len(registry)} tracked paper records from {path}")
+        return registry
 
     def get(self, paper_id: str) -> PaperRecord:
         return self._records.get(canonicalize_paper_id(paper_id), PaperRecord())
@@ -76,10 +77,6 @@ class PaperRegistry:
     def awaiting_publication(self) -> Dict[str, PaperRecord]:
         """Announced papers whose journal publication has not been announced yet."""
         return {pid: record for pid, record in self._records.items() if record.posted and not record.published}
-
-    def missing_metadata(self) -> List[str]:
-        """Announced papers whose stored title or author list is empty."""
-        return [pid for pid, record in self._records.items() if record.posted and (not record.title or not record.authors)]
 
     def record_paper(self, paper: Paper, *, posted: Optional[bool] = None, published: Optional[bool] = None) -> PaperRecord:
         """Stores a paper's latest metadata and, optionally, sets its flags."""
@@ -157,8 +154,9 @@ class PaperRegistry:
         self._dirty = False
 
 
-def _parse_line(line: str) -> Tuple[Optional[str], PaperRecord]:
-    """Parses one JSON registry line; unreadable lines are skipped with a warning."""
+def _parse_line(line: str) -> Optional[Dict[str, Any]]:
+    """Parses one JSON registry line into update() arguments plus "id";
+    unreadable lines are skipped with a warning."""
     try:
         data = json.loads(line)
         paper_id = data.get("id")
@@ -166,29 +164,18 @@ def _parse_line(line: str) -> Tuple[Optional[str], PaperRecord]:
             raise ValueError("JSON record missing string 'id'.")
 
         def text(key: str) -> Optional[str]:
-            value = data.get(key)
-            return value if isinstance(value, str) else None
+            return clean_optional_text(data.get(key))
 
         authors = data.get("authors")
-        return canonicalize_paper_id(paper_id), PaperRecord(
+        return dict(
+            id=paper_id,
             posted=bool(data.get("posted", True)),
             published=bool(data.get("published", False)),
             doi=text("doi"),
             journal_ref=text("journal_ref"),
             title=text("title"),
-            authors=[a for a in authors if isinstance(a, str)] if isinstance(authors, list) else [],
+            authors=authors if isinstance(authors, list) else [],
         )
     except Exception as e:
         logger.warning(f"Skipping unreadable tracked-paper record '{line}': {e}")
-        return None, PaperRecord()
-
-
-def _merge(existing: PaperRecord, record: PaperRecord) -> PaperRecord:
-    return PaperRecord(
-        posted=existing.posted or record.posted,
-        published=existing.published or record.published,
-        doi=record.doi or existing.doi,
-        journal_ref=record.journal_ref or existing.journal_ref,
-        title=record.title or existing.title,
-        authors=record.authors or existing.authors,
-    )
+        return None

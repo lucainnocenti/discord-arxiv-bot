@@ -1,4 +1,4 @@
-"""Shared data types for papers and the results of fetching them."""
+"""The shared Paper type and arXiv ID / text normalization."""
 
 import re
 from datetime import datetime
@@ -18,31 +18,6 @@ class Paper(NamedTuple):
     pdf_link: str        # Direct link to the PDF
     doi: Optional[str]   # DOI, if available
     journal_ref: Optional[str] # Journal reference, if available (e.g., "Phys. Rev. Lett. ...")
-    announce_type: Optional[str] # Where the record came from, e.g. 'api_new' or 'crossref_doi'
-
-
-class FetchPapersByIdResult(NamedTuple):
-    """Summarizes a tracked-paper metadata refresh attempt."""
-    papers: List[Paper]
-    requested_ids: List[str]
-    failed_ids: List[str]
-    degraded: bool
-
-
-class PublicationRefreshResult(NamedTuple):
-    """Summarizes publication-update detection for one bot run."""
-    updates: List[Paper]
-    checked_ids: List[str]
-    failed_ids: List[str]
-    degraded: bool
-
-
-class TrackedPaperMetadata(NamedTuple):
-    """Stored metadata retained locally so Crossref can run without a fresh arXiv hit."""
-    title: Optional[str]
-    authors: List[str]
-    doi: Optional[str]
-    journal_ref: Optional[str]
 
 
 def canonicalize_paper_id(raw_id: str) -> str:

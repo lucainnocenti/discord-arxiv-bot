@@ -10,10 +10,10 @@ from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from arxiv_source import ArxivSource, TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS
+from arxiv_source import RETRY_DELAYS_SECONDS, ArxivSource
 from crossref import CrossrefClient, choose_better_journal_ref, format_journal_ref
-from discord_formatter import format_paper_message
-from models import FetchPapersByIdResult, Paper, TrackedPaperMetadata
+from discord_formatter import format_new_paper, format_publication
+from models import Paper
 from publication_check import PublicationChecker
 from registry import PaperRecord, PaperRegistry
 from settings import AppSettings
@@ -50,17 +50,16 @@ def make_paper(**overrides) -> Paper:
         "pdf_link": "https://arxiv.org/pdf/2603.99999",
         "doi": None,
         "journal_ref": None,
-        "announce_type": "api_new",
     }
     data.update(overrides)
     return Paper(**data)
 
 
-def make_checker(settings: AppSettings, refresh: FetchPapersByIdResult) -> PublicationChecker:
+def make_checker(settings: AppSettings, papers=(), failed_ids=()) -> PublicationChecker:
     checker = PublicationChecker(ArxivSource(settings), CrossrefClient())
 
     async def fake_fetch(_paper_ids):
-        return refresh
+        return list(papers), list(failed_ids)
 
     checker.arxiv.fetch_by_ids = fake_fetch  # type: ignore[method-assign]
     return checker
@@ -139,7 +138,7 @@ class FormatterTests(unittest.TestCase):
     def test_format_publication_message_includes_doi(self):
         with workspace_tempdir() as tmpdir:
             paper = make_paper(doi="10.1000/example", journal_ref="Journal of Tests")
-            message = format_paper_message(paper, make_settings(tmpdir), event_type="published")
+            message = format_publication(paper, make_settings(tmpdir))
 
             self.assertIsNotNone(message)
             self.assertIn("was published! Cheers!", message)
@@ -154,7 +153,7 @@ class FormatterTests(unittest.TestCase):
                 target_authors=["Carla Bianca Rossi", "C. Bianca Rossi", "C Bianca Rossi"],
                 author_discord_ids={"Carla Bianca Rossi": 54321, "C. Bianca Rossi": 54321, "C Bianca Rossi": 54321},
             )
-            message = format_paper_message(make_paper(authors=["Carla B. Rossi", "Bob Example"]), settings)
+            message = format_new_paper(make_paper(authors=["Carla B. Rossi", "Bob Example"]), settings)
 
             self.assertIsNotNone(message)
             self.assertIn("**New paper by <@54321>**", message)
@@ -204,81 +203,74 @@ class CrossrefMatchingTests(unittest.TestCase):
 
 
 class PublicationCheckTests(unittest.TestCase):
-    def test_reports_partial_refresh(self):
-        with workspace_tempdir() as tmpdir:
-            checker = make_checker(make_settings(tmpdir), FetchPapersByIdResult(
-                papers=[make_paper(doi="10.1000/example", journal_ref="Journal of Tests")],
-                requested_ids=["2603.99999", "2603.88888"],
-                failed_ids=["2603.88888"],
-                degraded=True,
-            ))
-            with patch.object(checker.crossref, "fetch_work_by_doi", return_value=None):
-                result = asyncio.run(checker.find_updates(["2603.99999", "2603.88888"]))
+    RECORD = PaperRecord(posted=True, title="A Useful Quantum Paper", authors=["Alice Example", "Bob Example"])
 
-            self.assertTrue(result.degraded)
-            self.assertEqual(result.checked_ids, ["2603.99999"])
-            self.assertEqual(result.failed_ids, ["2603.88888"])
-            self.assertEqual(len(result.updates), 1)
-            self.assertEqual(result.updates[0].announce_type, "published_metadata")
+    def test_arxiv_publication_metadata_is_an_update(self):
+        with workspace_tempdir() as tmpdir:
+            checker = make_checker(make_settings(tmpdir), papers=[make_paper(doi="10.1000/example", journal_ref="Journal of Tests")])
+            with patch.object(checker.crossref, "fetch_work_by_doi", return_value=None),                     patch.object(checker.crossref, "find_publication", return_value=None) as search:
+                updates = asyncio.run(checker.find_updates({"2603.99999": self.RECORD}))
+
+            self.assertEqual([p.doi for p in updates], ["10.1000/example"])
+            # The journal ref is sparse, so Crossref is asked for a better one.
+            search.assert_called_once()
 
     def test_queries_crossref_for_unpublished_arxiv_record(self):
         with workspace_tempdir() as tmpdir:
             fetched_paper = make_paper()
-            checker = make_checker(make_settings(tmpdir), FetchPapersByIdResult(
-                papers=[fetched_paper], requested_ids=["2603.99999"], failed_ids=[], degraded=False,
-            ))
-            crossref_match = make_paper(doi="10.3000/article", journal_ref="Quantum Journal 12 (2026): 34", announce_type="crossref_published")
+            checker = make_checker(make_settings(tmpdir), papers=[fetched_paper])
+            crossref_match = make_paper(doi="10.3000/article", journal_ref="Quantum Journal 12 (2026): 34")
 
             with patch.object(checker.crossref, "find_publication", return_value=crossref_match) as mock_crossref:
-                with self.assertLogs("PublicationChecker", level="INFO") as captured_logs:
-                    result = asyncio.run(checker.find_updates(["2603.99999"]))
+                updates = asyncio.run(checker.find_updates({"2603.99999": self.RECORD}))
 
-            self.assertEqual(result.checked_ids, ["2603.99999"])
-            self.assertEqual(result.updates[0].doi, "10.3000/article")
+            self.assertEqual([p.doi for p in updates], ["10.3000/article"])
             mock_crossref.assert_called_once_with(fetched_paper)
-            self.assertIn("Publication update Crossref summary: 1 requests issued", "\n".join(captured_logs.output))
+
+    def test_unpublished_paper_gives_no_update(self):
+        with workspace_tempdir() as tmpdir:
+            checker = make_checker(make_settings(tmpdir), papers=[make_paper()])
+            with patch.object(checker.crossref, "find_publication", return_value=None):
+                self.assertEqual(asyncio.run(checker.find_updates({"2603.99999": self.RECORD})), [])
 
     def test_falls_back_to_crossref_for_failed_arxiv_refresh(self):
         with workspace_tempdir() as tmpdir:
-            checker = make_checker(make_settings(tmpdir), FetchPapersByIdResult(
-                papers=[], requested_ids=["2603.99999"], failed_ids=["2603.99999"], degraded=True,
-            ))
-            crossref_match = make_paper(doi="10.3000/article", journal_ref="Quantum Journal 12 (2026): 34", announce_type="crossref_published")
-            tracked_metadata = {
-                "2603.99999": TrackedPaperMetadata(
-                    title="A Useful Quantum Paper", authors=["Alice Example", "Bob Example"], doi=None, journal_ref=None,
-                )
-            }
+            checker = make_checker(make_settings(tmpdir), failed_ids=["2603.99999"])
+            crossref_match = make_paper(doi="10.3000/article", journal_ref="Quantum Journal 12 (2026): 34")
 
             with patch.object(checker.crossref, "find_publication", return_value=crossref_match) as mock_crossref:
-                with self.assertLogs("PublicationChecker", level="INFO") as captured_logs:
-                    result = asyncio.run(checker.find_updates(["2603.99999"], tracked_metadata=tracked_metadata))
+                updates = asyncio.run(checker.find_updates({"2603.99999": self.RECORD}))
 
-            self.assertTrue(result.degraded)
-            self.assertEqual(result.failed_ids, ["2603.99999"])
-            self.assertEqual(result.updates[0].doi, "10.3000/article")
-            mock_crossref.assert_called_once()
-            self.assertIn("Crossref-only fallback attempted for 1 failed arXiv refreshes", "\n".join(captured_logs.output))
+            self.assertEqual([p.doi for p in updates], ["10.3000/article"])
+            searched = mock_crossref.call_args.args[0]
+            self.assertEqual((searched.id, searched.title, searched.authors), ("2603.99999", self.RECORD.title, self.RECORD.authors))
 
 
 class ArxivRefreshTests(unittest.TestCase):
-    def test_transient_failure_is_retried_then_marked_degraded(self):
+    def test_transient_failure_is_retried_then_reported_as_failed(self):
         with workspace_tempdir() as tmpdir:
             source = ArxivSource(make_settings(tmpdir))
 
             with patch.object(source.client, "results", side_effect=Exception("HTTP 429")) as mock_results:
                 with patch("arxiv_source.asyncio.sleep", new=AsyncMock()) as mock_sleep:
-                    result = asyncio.run(source.fetch_by_ids(["2603.99999"]))
+                    papers, failed_ids = asyncio.run(source.fetch_by_ids(["2603.99999"]))
 
-            self.assertTrue(result.degraded)
-            self.assertEqual(result.papers, [])
-            self.assertEqual(result.failed_ids, ["2603.99999"])
+            self.assertEqual(papers, [])
+            self.assertEqual(failed_ids, ["2603.99999"])
             self.assertEqual(mock_results.call_count, 3)
-            self.assertEqual(
-                [call.args[0] for call in mock_sleep.await_args_list],
-                list(TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS),
-            )
+            self.assertEqual([call.args[0] for call in mock_sleep.await_args_list], list(RETRY_DELAYS_SECONDS))
 
+    def test_failed_chunk_stops_the_refresh(self):
+        with workspace_tempdir() as tmpdir:
+            source = ArxivSource(make_settings(tmpdir))
+            ids = [f"2603.{n:05d}" for n in range(15)]
+
+            with patch.object(source.client, "results", side_effect=Exception("HTTP 400")) as mock_results:
+                papers, failed_ids = asyncio.run(source.fetch_by_ids(ids))
+
+            self.assertEqual(papers, [])
+            self.assertEqual(failed_ids, ids)
+            mock_results.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

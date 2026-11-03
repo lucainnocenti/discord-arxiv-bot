@@ -79,23 +79,6 @@ def previous_announcement_day(day: date) -> date:
     return previous
 
 
-def read_last_covered(path: str) -> Optional[date]:
-    """The latest announcement day whose papers (and all before it) were processed."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return date.fromisoformat(f.read().strip())
-    except FileNotFoundError:
-        return None
-    except ValueError as e:
-        logger.warning(f"Ignoring unreadable {path}: {e}")
-        return None
-
-
-def write_last_covered(path: str, day: date):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(day.isoformat())
-
-
 def _paper_from_item(item: ET.Element) -> Optional[Paper]:
     announce_type = (item.findtext("arxiv:announce_type", "", NAMESPACES) or "").strip()
     if announce_type not in NEW_PAPER_ANNOUNCE_TYPES:
@@ -117,7 +100,6 @@ def _paper_from_item(item: ET.Element) -> Optional[Paper]:
         pdf_link=f"https://arxiv.org/pdf/{paper_id}",
         doi=clean_optional_text(item.findtext("arxiv:DOI", None, NAMESPACES)),
         journal_ref=clean_optional_text(item.findtext("arxiv:journal_reference", None, NAMESPACES)),
-        announce_type=f"rss_{announce_type}",
     )
 
 

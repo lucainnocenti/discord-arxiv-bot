@@ -58,7 +58,7 @@ class WebhookSelectionTests(unittest.TestCase):
             settings.use_test_channel = True
             self.assertEqual(settings.webhook_url, "test")
 
-    def test_no_webhook_configured_means_bot_login(self):
+    def test_no_webhook_configured_gives_no_url(self):
         with workspace_tempdir() as tmpdir:
             self.assertIsNone(make_settings(tmpdir).webhook_url)
 
