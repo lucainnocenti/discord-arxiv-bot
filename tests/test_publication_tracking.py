@@ -10,7 +10,13 @@ from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from arxiv_fetcher import ArxivFetcher, FetchPapersByIdResult, Paper, TrackedPaperMetadata
+from arxiv_fetcher import (
+    ArxivFetcher,
+    FetchPapersByIdResult,
+    Paper,
+    TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS,
+    TrackedPaperMetadata,
+)
 from discord_formatter import format_paper_message
 from settings import AppSettings
 from state_manager import PaperRecord, StateManager
@@ -98,6 +104,27 @@ class PublicationTrackingTests(unittest.TestCase):
             self.assertEqual(registry["2603.99999"].title, "A Useful Quantum Paper")
             self.assertEqual(registry["2603.99999"].authors, ["Alice Example", "Bob Example"])
 
+    def test_upsert_paper_record_does_not_replace_authors_with_empty_update(self):
+        with workspace_tempdir() as tmpdir:
+            settings = make_settings(tmpdir)
+            manager = StateManager(settings)
+            manager.upsert_paper_record(
+                "2603.99999",
+                posted=True,
+                title="A Useful Quantum Paper",
+                authors=["Alice Example", "Bob Example"],
+            )
+
+            record = manager.upsert_paper_record(
+                "2603.99999",
+                published=True,
+                doi="10.2000/final",
+                authors=[],
+            )
+
+            self.assertTrue(record.published)
+            self.assertEqual(record.authors, ["Alice Example", "Bob Example"])
+
     def test_format_publication_message_includes_doi(self):
         with workspace_tempdir() as tmpdir:
             settings = make_settings(tmpdir)
@@ -128,6 +155,25 @@ class PublicationTrackingTests(unittest.TestCase):
             fetcher = ArxivFetcher(settings)
 
             self.assertTrue(fetcher._is_author_match(["Marcel A. Pinto", "Coauthor Example"]))
+
+    def test_is_author_match_rejects_different_full_name_matching_initial_alias(self):
+        with workspace_tempdir() as tmpdir:
+            settings = AppSettings(
+                discord_token="token",
+                channel_id=1,
+                test_channel_id=2,
+                target_authors=[
+                    "Subhojit Pal",
+                    "S. Pal",
+                    "S Pal",
+                ],
+                author_discord_ids={},
+                script_dir=tmpdir,
+            )
+            fetcher = ArxivFetcher(settings)
+
+            self.assertFalse(fetcher._is_author_match(["Subhajit Pal", "Coauthor Example"]))
+            self.assertTrue(fetcher._is_author_match(["S. Pal", "Coauthor Example"]))
 
     def test_format_message_mentions_canonical_author_for_initial_variant(self):
         with workspace_tempdir() as tmpdir:
@@ -376,6 +422,10 @@ class PublicationTrackingTests(unittest.TestCase):
             self.assertEqual(result.failed_ids, ["2603.99999"])
             self.assertEqual(mock_results.call_count, 3)
             self.assertEqual(mock_sleep.await_count, 2)
+            self.assertEqual(
+                [call.args[0] for call in mock_sleep.await_args_list],
+                list(TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS),
+            )
 
 
 if __name__ == "__main__":

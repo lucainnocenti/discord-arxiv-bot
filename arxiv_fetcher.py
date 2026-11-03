@@ -67,7 +67,9 @@ TITLE_NORMALIZATION_PATTERN = re.compile(r'[^a-z0-9]+')
 CROSSREF_API_URL = "https://api.crossref.org/works"
 HTTP_STATUS_PATTERN = re.compile(r'HTTP (\d{3})')
 TRANSIENT_ARXIV_STATUS_CODES = {429, 500, 502, 503, 504}
-TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS = (20, 60)
+TRACKED_PAPER_REFRESH_CHUNK_SIZE = 10
+TRACKED_PAPER_REFRESH_CHUNK_DELAY_SECONDS = 5
+TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS = (60, 300)
 
 
 def canonicalize_paper_id(raw_id: str) -> str:
@@ -229,6 +231,10 @@ class ArxivFetcher:
             failed_ids=tracked_paper_fetch.failed_ids,
             degraded=tracked_paper_fetch.degraded,
         )
+
+    async def fetch_papers_by_ids(self, paper_ids: List[str]) -> FetchPapersByIdResult:
+        """Fetches arXiv metadata for specific paper IDs."""
+        return await self._fetch_papers_by_ids(paper_ids)
 
     async def enrich_publication_metadata(
         self,
@@ -480,10 +486,9 @@ class ArxivFetcher:
         papers_by_id: Dict[str, Paper] = {}
         failed_ids: List[str] = []
         degraded = False
-        chunk_size = 50
         id_chunks = [
-            normalized_ids[i:i + chunk_size]
-            for i in range(0, len(normalized_ids), chunk_size)
+            normalized_ids[i:i + TRACKED_PAPER_REFRESH_CHUNK_SIZE]
+            for i in range(0, len(normalized_ids), TRACKED_PAPER_REFRESH_CHUNK_SIZE)
         ]
 
         for index, id_chunk in enumerate(id_chunks, start=1):
@@ -495,7 +500,8 @@ class ArxivFetcher:
 
             chunk_results = []
             chunk_succeeded = False
-            for attempt, backoff_seconds in enumerate((0, *TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS), start=1):
+            max_attempts = len(TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS) + 1
+            for attempt in range(1, max_attempts + 1):
                 try:
                     results_iterator = self.arxiv_client.results(search)
                     chunk_results = await loop.run_in_executor(None, list, results_iterator)
@@ -503,16 +509,17 @@ class ArxivFetcher:
                     break
                 except Exception as e:
                     retryable = self._is_retryable_arxiv_error(e)
-                    is_last_attempt = attempt == len(TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS) + 1
+                    is_last_attempt = attempt == max_attempts
 
                     if retryable and not is_last_attempt:
+                        backoff_seconds = TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS[attempt - 1]
                         self.logger.warning(
                             "Transient arXiv error while refreshing tracked papers for chunk %d/%d "
                             "(attempt %d/%d): %s. Cooling down for %d seconds before retrying.",
                             index,
                             len(id_chunks),
                             attempt,
-                            len(TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS) + 1,
+                            max_attempts,
                             self._summarize_exception(e),
                             backoff_seconds,
                         )
@@ -579,7 +586,7 @@ class ArxivFetcher:
                 )
 
             if index < len(id_chunks):
-                await asyncio.sleep(3)
+                await asyncio.sleep(TRACKED_PAPER_REFRESH_CHUNK_DELAY_SECONDS)
 
         return FetchPapersByIdResult(
             papers=[papers_by_id[paper_id] for paper_id in normalized_ids if paper_id in papers_by_id],

@@ -68,8 +68,13 @@ def _author_name_tokens(name: str) -> List[str]:
 
 
 def _author_tokens_compatible(left: str, right: str) -> bool:
-    return (
-        left == right
-        or (len(left) == 1 and right.startswith(left))
-        or (len(right) == 1 and left.startswith(right))
-    )
+    if left == right:
+        return True
+
+    # `left` is the paper author and `right` is the configured target author.
+    # Initials in the paper can match full configured names, but a configured
+    # initial-only alias should not match a different full first name.
+    if len(left) == 1 and right.startswith(left):
+        return True
+
+    return False

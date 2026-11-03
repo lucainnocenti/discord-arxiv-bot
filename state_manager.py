@@ -95,6 +95,15 @@ class StateManager:
         registry = self.get_paper_registry()
         canonical_paper_id = canonicalize_paper_id(paper_id)
         current = registry.get(canonical_paper_id, PaperRecord())
+        cleaned_authors = (
+            [
+                author.strip()
+                for author in authors
+                if isinstance(author, str) and author.strip()
+            ]
+            if authors is not None
+            else None
+        )
         updated = PaperRecord(
             # Treat posted/published as sticky flags: once True, never revert to
             # False just because a later call omitted that field.
@@ -103,7 +112,7 @@ class StateManager:
             doi=doi or current.doi,
             journal_ref=journal_ref or current.journal_ref,
             title=title or current.title,
-            authors=list(authors) if authors is not None else list(current.authors),
+            authors=cleaned_authors or list(current.authors),
         )
         registry[canonical_paper_id] = updated
 

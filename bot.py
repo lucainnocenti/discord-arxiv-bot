@@ -146,7 +146,9 @@ class ArxivBotClient(discord.Client):
 
         # Second pass: revisit already-posted papers that still look
         # unpublished and emit a shorter "now published" message if needed.
+        metadata_hydrated_count, metadata_hydration_degraded = await self._hydrate_incomplete_paper_records()
         publication_updates_count, publication_check_degraded = await self._check_for_publication_updates(channel)
+        publication_check_degraded = publication_check_degraded or metadata_hydration_degraded
 
         if papers_posted_count == 0 and publication_updates_count == 0:
             if publication_check_degraded:
@@ -159,7 +161,8 @@ class ArxivBotClient(discord.Client):
         else:
             self.logger.info(
                 f"Finished processing. Posted {papers_posted_count} new paper notifications and "
-                f"{publication_updates_count} publication updates."
+                f"{publication_updates_count} publication updates; hydrated metadata for "
+                f"{metadata_hydrated_count} tracked records."
             )
             if publication_check_degraded:
                 self.logger.warning(
@@ -179,6 +182,53 @@ class ArxivBotClient(discord.Client):
              # This covers cases where papers were found or where the check ran but found nothing new.
              if not self.state_manager.has_checked_rss_today() or self.settings.force_rss_check:
                  self.state_manager.save_rss_check_time()
+
+    async def _hydrate_incomplete_paper_records(self) -> tuple[int, bool]:
+        """Backfills title/author metadata for legacy or sparse registry records."""
+        candidate_ids = [
+            paper_id
+            for paper_id, record in self.paper_registry.items()
+            if record.posted and (not record.title or not record.authors)
+        ]
+        if not candidate_ids:
+            self.logger.info("No tracked paper records need metadata hydration.")
+            return 0, False
+
+        self.logger.info(f"Hydrating metadata for {len(candidate_ids)} incomplete tracked paper records.")
+        try:
+            refresh_result = await self.fetcher.fetch_papers_by_ids(candidate_ids)
+        except Exception as e:
+            self.logger.exception(f"Failed to hydrate tracked paper metadata: {e}")
+            return 0, True
+
+        hydrated_count = 0
+        for paper in refresh_result.papers:
+            current_record = self.paper_registry.get(paper.id, PaperRecord())
+            if current_record.title and current_record.authors:
+                continue
+
+            record = self.state_manager.upsert_paper_record(
+                paper.id,
+                posted=current_record.posted,
+                published=current_record.published,
+                doi=paper.doi,
+                journal_ref=paper.journal_ref,
+                title=paper.title,
+                authors=paper.authors,
+            )
+            self.paper_registry[paper.id] = record
+            hydrated_count += 1
+
+        if refresh_result.degraded:
+            self.logger.warning(
+                "Metadata hydration was partial: refreshed %d/%d tracked papers; "
+                "%d were deferred to a future run.",
+                len(refresh_result.papers),
+                len(candidate_ids),
+                len(refresh_result.failed_ids),
+            )
+
+        return hydrated_count, refresh_result.degraded
 
     async def _check_for_publication_updates(self, channel: discord.TextChannel) -> tuple[int, bool]:
         """Checks whether already-posted arXiv papers now have publication metadata."""
