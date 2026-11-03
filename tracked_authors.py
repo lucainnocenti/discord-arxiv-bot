@@ -1,4 +1,5 @@
-"""Loads, expands, and persists the list of tracked authors.
+"""The tracked authors: who they are, how to recognise them in a paper's
+author list, and the file that lists them.
 
 The list lives in tracked_authors.json next to the bot so it can be edited by
 hand and extended automatically by the website member sync. Each entry records
@@ -14,7 +15,7 @@ import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import date
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 MANUAL_SOURCE = "manual"
 WEBSITE_SOURCE = "website"
@@ -32,6 +33,15 @@ class TrackedAuthor:
     added: Optional[str] = None
     website_slug: Optional[str] = None
 
+    @property
+    def names(self) -> List[str]:
+        """The canonical name followed by any extra spellings."""
+        return list(dict.fromkeys([self.name, *self.variations]))
+
+    def matches(self, paper_author: str) -> bool:
+        """True if `paper_author`, as written on a paper, is this person."""
+        return any(author_names_match(paper_author, name) for name in self.names)
+
 
 @dataclass
 class TrackedAuthorList:
@@ -39,6 +49,20 @@ class TrackedAuthorList:
     # Website member names that must never be auto-added (e.g. someone removed
     # by hand, or whose website name never matches their arXiv name).
     ignored_website_names: List[str] = field(default_factory=list)
+
+    def all_names(self) -> List[str]:
+        """Every name and spelling of every tracked author."""
+        return list(dict.fromkeys(name for author in self.authors for name in author.names))
+
+    def found_in(self, paper_authors: List[str]) -> List[TrackedAuthor]:
+        """The tracked authors among `paper_authors`, each once, in paper order."""
+        found: List[TrackedAuthor] = []
+        for paper_author in paper_authors:
+            for author in self.authors:
+                if author.matches(paper_author) and all(author is not other for other in found):
+                    found.append(author)
+                    break
+        return found
 
 
 def load_tracked_authors(path: str) -> TrackedAuthorList:
@@ -83,29 +107,6 @@ def save_tracked_authors(path: str, tracked: TrackedAuthorList):
     os.replace(tmp_path, path)
 
 
-def author_name_variants(author: TrackedAuthor) -> List[str]:
-    """Returns the canonical name followed by any extra spellings."""
-    return list(dict.fromkeys([author.name, *author.variations]))
-
-
-def expand_target_names(tracked: TrackedAuthorList) -> List[str]:
-    """Flattens tracked authors into the name list the matcher works on."""
-    names: List[str] = []
-    for author in tracked.authors:
-        names.extend(author_name_variants(author))
-    return list(dict.fromkeys(names))
-
-
-def expand_discord_ids(tracked: TrackedAuthorList) -> Dict[str, int]:
-    """Maps every name of each author with a Discord ID to that ID."""
-    return {
-        variant: author.discord_id
-        for author in tracked.authors
-        if author.discord_id
-        for variant in author_name_variants(author)
-    }
-
-
 def new_website_author(name: str, slug: Optional[str], group: Optional[str]) -> TrackedAuthor:
     return TrackedAuthor(
         name=name,
@@ -117,7 +118,10 @@ def new_website_author(name: str, slug: Optional[str], group: Optional[str]) -> 
 
 
 def author_names_match(left: str, right: str) -> bool:
-    """Matches author names across common initial and middle-name variations."""
+    """
+    Matches a name as written on a paper (`left`) against a configured name
+    (`right`), allowing initials and dropped middle names on the paper side.
+    """
     left_clean = left.strip().casefold()
     right_clean = right.strip().casefold()
     if not left_clean or not right_clean:
@@ -139,17 +143,6 @@ def author_names_match(left: str, right: str) -> bool:
         _author_tokens_compatible(left_token, right_token)
         for left_token, right_token in zip(left_tokens[:-1], right_tokens[:-1])
     )
-
-
-def find_matching_target_authors(paper_authors: List[str], target_authors: List[str]) -> List[str]:
-    """Returns canonical configured target authors found in the paper author list."""
-    matched_targets: List[str] = []
-    for paper_author in paper_authors:
-        for target_author in target_authors:
-            if target_author not in matched_targets and author_names_match(paper_author, target_author):
-                matched_targets.append(target_author)
-                break
-    return matched_targets
 
 
 def _author_tokens_compatible(left: str, right: str) -> bool:

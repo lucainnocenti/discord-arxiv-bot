@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 STALE_LOCK_AGE = timedelta(minutes=30)
 
-logger = logging.getLogger("RunLock")
+logger = logging.getLogger(__name__)
 
 
 class LockHeldElsewhere(RuntimeError):

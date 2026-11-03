@@ -43,7 +43,7 @@ class WebhookSenderTests(unittest.TestCase):
         sleep.assert_called_once_with(2.5)
 
     def test_rejected_message_returns_false_without_logging_url(self):
-        with self.assertLogs("DiscordWebhook", level="ERROR") as logs:
+        with self.assertLogs("discord_webhook", level="ERROR") as logs:
             delivered, _, _ = self.send(http_error(404, b'{"message": "Unknown Webhook"}'))
 
         self.assertFalse(delivered)

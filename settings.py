@@ -5,14 +5,13 @@ import argparse
 import os
 import socket
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-from tracked_authors import expand_discord_ids, expand_target_names, load_tracked_authors
+from tracked_authors import TrackedAuthorList, load_tracked_authors
 
 # Several group members also publish in condensed matter. "cond-mat" is an
 # archive and covers all of its subcategories (cond-mat.mes-hall, ...).
 DEFAULT_CATEGORIES = ("quant-ph", "cond-mat")
-DEFAULT_MAX_RESULTS = 1000
 # arXiv announces papers up to ~4 days after submission (weekends, holidays,
 # skipped mailings), so a week-long window leaves a comfortable margin.
 DEFAULT_LOOKBACK_DAYS = 7
@@ -22,8 +21,8 @@ DEFAULT_LOOKBACK_DAYS = 7
 class AppSettings:
     """Holds all application settings."""
     # Filled from tracked_authors.json by reload_tracked_authors().
-    target_authors: List[str] = field(default_factory=list)
-    author_discord_ids: Dict[str, int] = field(default_factory=dict)
+    authors: TrackedAuthorList = field(default_factory=TrackedAuthorList)
+    categories: List[str] = field(default_factory=lambda: list(DEFAULT_CATEGORIES))
 
     # Private values (config.py or environment)
     discord_webhook_url: Optional[str] = None
@@ -32,15 +31,6 @@ class AppSettings:
     members_page_url: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
-
-    # File paths, all next to the bot
-    script_dir: str = field(default_factory=lambda: os.path.dirname(os.path.abspath(__file__)))
-    log_path: str = field(init=False)
-    run_lock_file: str = field(init=False)
-    posted_papers_file: str = field(init=False)
-    tracked_authors_file: str = field(init=False)
-    last_member_sync_file: str = field(init=False)
-    rss_coverage_file: str = field(init=False)
 
     # Command-line flags
     no_save: bool = False
@@ -54,9 +44,14 @@ class AppSettings:
     rss_only: bool = False
     force_api: bool = False
 
-    # Fetching parameters
-    categories: List[str] = field(default_factory=lambda: list(DEFAULT_CATEGORIES))
-    max_results: int = DEFAULT_MAX_RESULTS
+    # File paths, all next to the bot
+    script_dir: str = field(default_factory=lambda: os.path.dirname(os.path.abspath(__file__)))
+    log_path: str = field(init=False)
+    run_lock_file: str = field(init=False)
+    posted_papers_file: str = field(init=False)
+    tracked_authors_file: str = field(init=False)
+    last_member_sync_file: str = field(init=False)
+    rss_coverage_file: str = field(init=False)
 
     def __post_init__(self):
         # One log per machine: the folder is synced between computers, and a
@@ -68,13 +63,6 @@ class AppSettings:
         self.last_member_sync_file = os.path.join(self.script_dir, "last_member_sync.txt")
         self.rss_coverage_file = os.path.join(self.script_dir, "last_rss_announcement.txt")
 
-        if self.lookback_days < 1:
-            raise ValueError("--days must be at least 1.")
-        if self.rss_only and self.force_api:
-            raise ValueError("--rss and --api are mutually exclusive.")
-        if self.force_member_sync and not self.member_sync_enabled:
-            raise ValueError("--forcemembersync is not compatible with --nomembersync.")
-
     @property
     def webhook_url(self) -> Optional[str]:
         """The webhook for the channel this run posts to."""
@@ -82,23 +70,12 @@ class AppSettings:
 
     def reload_tracked_authors(self):
         """Re-reads tracked_authors.json, e.g. after the website sync added names."""
-        tracked = load_tracked_authors(self.tracked_authors_file)
-        self.target_authors = expand_target_names(tracked)
-        self.author_discord_ids = expand_discord_ids(tracked)
+        self.authors = load_tracked_authors(self.tracked_authors_file)
 
 
 def load_settings() -> AppSettings:
     """Builds settings from command-line flags, config.py and the environment."""
-    parser = argparse.ArgumentParser(description="Posts new and newly published arXiv papers by tracked authors to Discord.")
-    parser.add_argument("--nosave", action="store_true", help="Don't write the paper registry or other state.")
-    parser.add_argument("--nosend", action="store_true", help="Don't post anything to Discord.")
-    parser.add_argument("--days", type=int, default=DEFAULT_LOOKBACK_DAYS, help=f"Minimum window of the API search, in days (default {DEFAULT_LOOKBACK_DAYS}).")
-    parser.add_argument("--rss", action="store_true", help="Use only the RSS feed, never the gap-filling API search.")
-    parser.add_argument("--api", action="store_true", help="Also run the API search over the --days window, even if the feed covers everything.")
-    parser.add_argument("--testchannel", action="store_true", help="Post to the test channel's webhook.")
-    parser.add_argument("--nomembersync", action="store_true", help="Skip the weekly sync of new authors from the group website.")
-    parser.add_argument("--forcemembersync", action="store_true", help="Run the website member sync even if it ran this week.")
-    args = parser.parse_args()
+    args = _parse_args()
 
     # Imported here so the rest of the code (and the tests) work without a
     # private config.py; see config.example.py.
@@ -131,3 +108,27 @@ def load_settings() -> AppSettings:
 
     settings.reload_tracked_authors()
     return settings
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Posts new and newly published arXiv papers by tracked authors to Discord.")
+    parser.add_argument("--nosave", action="store_true", help="Don't write the paper registry or other state.")
+    parser.add_argument("--nosend", action="store_true", help="Don't post anything to Discord.")
+    parser.add_argument("--testchannel", action="store_true", help="Post to the test channel's webhook.")
+    parser.add_argument("--days", type=_positive_int, default=DEFAULT_LOOKBACK_DAYS, help=f"Minimum window of the API search, in days (default {DEFAULT_LOOKBACK_DAYS}).")
+
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--rss", action="store_true", help="Use only the RSS feed, never the gap-filling API search.")
+    source.add_argument("--api", action="store_true", help="Also run the API search over the --days window, even if the feed covers everything.")
+
+    member_sync = parser.add_mutually_exclusive_group()
+    member_sync.add_argument("--nomembersync", action="store_true", help="Skip the weekly sync of new authors from the group website.")
+    member_sync.add_argument("--forcemembersync", action="store_true", help="Run the website member sync even if it ran this week.")
+    return parser.parse_args()
+
+
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value

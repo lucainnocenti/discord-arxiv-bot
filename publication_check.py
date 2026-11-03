@@ -9,20 +9,20 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from arxiv_source import ArxivSource
+from arxiv_api import ArxivApi
 from crossref import CrossrefClient, journal_ref_needs_enrichment, merge_crossref_item
 from models import Paper
 from registry import PaperRecord
 
 
 class PublicationChecker:
-    def __init__(self, arxiv_source: ArxivSource, crossref: CrossrefClient):
-        self.arxiv = arxiv_source
+    def __init__(self, api: ArxivApi, crossref: CrossrefClient):
+        self.api = api
         self.crossref = crossref
 
     async def find_updates(self, tracked: Dict[str, PaperRecord]) -> List[Paper]:
         """Refreshes tracked papers from arXiv and returns the ones that now look published."""
-        papers, failed_ids = await self.arxiv.fetch_by_ids(list(tracked))
+        papers, failed_ids = await self.api.fetch_by_ids(list(tracked))
         # Papers arXiv could not refresh are still checked on Crossref, from
         # the metadata stored when they were posted.
         papers += [_paper_from_record(paper_id, tracked[paper_id]) for paper_id in failed_ids]
@@ -71,10 +71,9 @@ def _paper_from_record(paper_id: str, record: PaperRecord) -> Paper:
         id=paper_id,
         title=record.title or "",
         authors=list(record.authors),
-        published=datetime.now(timezone.utc),
+        submitted=datetime.now(timezone.utc),  # unknown, and not needed for a publication update
         summary="",
         link=f"https://arxiv.org/abs/{paper_id}",
-        pdf_link=f"https://arxiv.org/pdf/{paper_id}",
         doi=record.doi,
         journal_ref=record.journal_ref,
     )

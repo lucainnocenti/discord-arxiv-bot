@@ -1,14 +1,14 @@
-"""Reads the arXiv RSS feed for some categories: the papers in the latest daily
+"""The arXiv RSS feed for some categories: the papers in the latest daily
 announcement, and that announcement's date.
 
-The feed only holds the latest mailing (and is empty until it is out), so the
-bot uses it for each day's papers and the API search for any days it missed.
+The feed only holds the latest mailing (and is empty until it is out); see
+new_papers.py for how the bot combines it with the API search.
 """
 
 import logging
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import List, NamedTuple, Optional
 
@@ -25,7 +25,7 @@ NAMESPACES = {
     "dc": "http://purl.org/dc/elements/1.1/",
 }
 
-logger = logging.getLogger("RssSource")
+logger = logging.getLogger(__name__)
 _latex = LatexNodes2Text()
 
 
@@ -71,14 +71,6 @@ def parse_feed(xml_text) -> RssFeed:
     return RssFeed(announced, papers)
 
 
-def previous_announcement_day(day: date) -> date:
-    """The weekday before `day`: arXiv announces Monday to Friday."""
-    previous = day - timedelta(days=1)
-    while previous.weekday() >= 5:
-        previous -= timedelta(days=1)
-    return previous
-
-
 def _paper_from_item(item: ET.Element) -> Optional[Paper]:
     announce_type = (item.findtext("arxiv:announce_type", "", NAMESPACES) or "").strip()
     if announce_type not in NEW_PAPER_ANNOUNCE_TYPES:
@@ -94,10 +86,9 @@ def _paper_from_item(item: ET.Element) -> Optional[Paper]:
         title=_decode(item.findtext("title") or ""),
         authors=[_decode(name) for name in creators.split(",") if name.strip()],
         # The feed only has the announcement date, not the submission date.
-        published=parsedate_to_datetime(pub_date) if pub_date else datetime.now(timezone.utc),
+        submitted=parsedate_to_datetime(pub_date) if pub_date else datetime.now(timezone.utc),
         summary=_abstract(item.findtext("description") or ""),
         link=link or f"https://arxiv.org/abs/{paper_id}",
-        pdf_link=f"https://arxiv.org/pdf/{paper_id}",
         doi=clean_optional_text(item.findtext("arxiv:DOI", None, NAMESPACES)),
         journal_ref=clean_optional_text(item.findtext("arxiv:journal_reference", None, NAMESPACES)),
     )

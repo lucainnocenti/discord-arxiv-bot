@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from models import Paper, canonicalize_paper_id, clean_optional_text
 
-logger = logging.getLogger("PaperRegistry")
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,10 +30,10 @@ class PaperRecord:
 
 
 class PaperRegistry:
-    def __init__(self, path: str, records: Optional[Dict[str, PaperRecord]] = None, *, read_only: bool = False):
+    def __init__(self, path: str, *, read_only: bool = False):
         self.path = path
         self.read_only = read_only
-        self._records: Dict[str, PaperRecord] = records or {}
+        self._records: Dict[str, PaperRecord] = {}
         self._dirty = False
 
     @classmethod

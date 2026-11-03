@@ -77,17 +77,20 @@ Don't edit the registry while the bot is running.
 
 | Module | Responsibility |
 |---|---|
-| `bot.py` | Entry point: logging, run lock, member sync, then the pipeline |
-| `pipeline.py` | One run's logic; posts through a `send` function |
-| `arxiv_source.py` | Finds new papers (RSS feed first, API search for gaps), tracks the last announcement processed; refreshes known papers by ID |
-| `rss_source.py` | Parses the RSS feed of the latest announcement |
-| `publication_check.py` | Decides whether tracked papers are now published |
+| `bot.py` | Entry point: logging, run lock, member sync, wiring, then the pipeline |
+| `settings.py` | Command-line flags, `config.py` values, file paths, the tracked authors |
+| `pipeline.py` | One run: post new papers, then publication updates, through a `send` function |
+| `new_papers.py` | Decides where the day's papers come from (RSS feed first, API search for gaps) and tracks the last announcement processed |
+| `arxiv_rss.py` / `arxiv_api.py` | The two arXiv sources: the daily feed, and the search/ID API with retries |
+| `publication_check.py` | Decides whether tracked papers are now published (arXiv metadata, then Crossref) |
 | `crossref.py` | Paced Crossref client, matching rules, citation formatting |
 | `registry.py` | The paper registry (load once, save atomically) |
 | `discord_formatter.py` / `discord_webhook.py` | Message text / delivery |
-| `tracked_authors.py` | Author list and author-name matching |
+| `tracked_authors.py` | The tracked authors, how their names are matched, and their file |
 | `member_sync.py` | Website member sync |
 | `notifier.py`, `utils.py` | Telegram messages; the one-date state files |
+
+Every module logs under its own name, e.g. `[new_papers]` in the log file.
 
 `other scripts/` holds unrelated helpers, such as `dms_handler.py`, a separate
 Discord bot for DM forwarding and channel commands. Their extra dependencies

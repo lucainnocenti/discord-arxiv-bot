@@ -9,11 +9,12 @@ from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import arxiv_source
 import crossref
-from arxiv_source import ArxivSource
+import new_papers
+from arxiv_api import ArxivApi, category_query
+from arxiv_rss import RssFeed, parse_feed, rss_url
 from crossref import CrossrefClient
-from rss_source import RssFeed, parse_feed, rss_url
+from new_papers import NewPaperFinder
 from run_lock import LockHeldElsewhere, run_lock
 from tests.test_publication_tracking import make_paper, make_settings, workspace_tempdir
 from utils import read_date, write_date
@@ -27,22 +28,22 @@ class RecentPapersTests(unittest.TestCase):
 
     def run_search(self, *, feed=None, feed_error=False, last_covered=None, api_papers=(), api_complete=True, **overrides):
         with workspace_tempdir() as tmpdir:
-            source = ArxivSource(make_settings(tmpdir, **overrides))
+            finder = NewPaperFinder(make_settings(tmpdir, **overrides), ArxivApi())
             if last_covered:
-                write_date(source.settings.rss_coverage_file, last_covered)
+                write_date(finder.settings.rss_coverage_file, last_covered)
             seen_since = []
 
-            async def fake_api(since):
+            async def fake_search(categories, author_names, since):
                 seen_since.append(since)
                 return list(api_papers), api_complete
 
-            source._search_since = fake_api  # type: ignore[method-assign]
+            finder.api.search = fake_search  # type: ignore[method-assign]
             rss = dict(side_effect=OSError("down")) if feed_error else dict(return_value=feed)
-            with patch.object(arxiv_source, "fetch_rss_feed", **rss):
-                papers, covered_day = asyncio.run(source.search_recent())
+            with patch.object(new_papers, "fetch_rss_feed", **rss):
+                papers, covered_day = asyncio.run(finder.find())
             if covered_day:
-                source.record_coverage(covered_day)
-            covered = read_date(source.settings.rss_coverage_file)
+                finder.record_coverage(covered_day)
+            covered = read_date(finder.settings.rss_coverage_file)
         return [p.id for p in papers], seen_since, covered
 
     def test_consecutive_announcement_uses_only_the_feed(self):
@@ -85,7 +86,7 @@ class RecentPapersTests(unittest.TestCase):
 
     def test_empty_or_unreadable_feed_notifies_when_falling_back(self):
         for rss in ({"feed": RssFeed(TUESDAY, [])}, {"feed_error": True}):
-            with self.subTest(rss=rss), patch.object(arxiv_source, "send_telegram_message", return_value=False) as notify:
+            with self.subTest(rss=rss), patch.object(new_papers, "send_telegram_message", return_value=False) as notify:
                 _, searches, _ = self.run_search(last_covered=MONDAY, **rss)
                 self.assertEqual(len(searches), 1)
                 notify.assert_called_once()
@@ -102,7 +103,7 @@ class RecentPapersTests(unittest.TestCase):
             dict(feed=RssFeed(TUESDAY, []), rss_only=True),
         ]
         for case in cases:
-            with self.subTest(case=case), patch.object(arxiv_source, "send_telegram_message") as notify:
+            with self.subTest(case=case), patch.object(new_papers, "send_telegram_message") as notify:
                 self.run_search(**case)
                 notify.assert_not_called()
 
@@ -151,11 +152,11 @@ class ApiSearchTests(unittest.TestCase):
     AUTHORS = [f"Author{n} Example" for n in range(25)]  # two query chunks
 
     def search(self, *chunk_results):
-        with workspace_tempdir() as tmpdir:
-            source = ArxivSource(make_settings(tmpdir, target_authors=self.AUTHORS))
-            with patch.object(source.client, "results", side_effect=list(chunk_results)) as results, \
-                    patch("arxiv_source.asyncio.sleep", new=AsyncMock()):
-                papers, complete = asyncio.run(source._search_since(datetime(2026, 11, 1, tzinfo=timezone.utc)))
+        api = ArxivApi()
+        with patch.object(api.client, "results", side_effect=list(chunk_results)) as results, \
+                patch("arxiv_api.asyncio.sleep", new=AsyncMock()):
+            since = datetime(2026, 11, 1, tzinfo=timezone.utc)
+            papers, complete = asyncio.run(api.search(["quant-ph"], self.AUTHORS, since))
         return [p.id for p in papers], complete, results.call_count
 
     def test_chunks_are_merged_deduplicated_and_sorted(self):
@@ -225,8 +226,8 @@ class CategoryTests(unittest.TestCase):
         self.assertEqual(rss_url(["quant-ph", "cond-mat"]), "https://rss.arxiv.org/rss/quant-ph+cond-mat")
 
     def test_api_query_matches_archive_subcategories(self):
-        self.assertEqual(arxiv_source._category_query(["quant-ph", "cond-mat"]), "(cat:quant-ph* OR cat:cond-mat*)")
-        self.assertEqual(arxiv_source._category_query(["cond-mat.mes-hall"]), "cat:cond-mat.mes-hall")
+        self.assertEqual(category_query(["quant-ph", "cond-mat"]), "(cat:quant-ph* OR cat:cond-mat*)")
+        self.assertEqual(category_query(["cond-mat.mes-hall"]), "cat:cond-mat.mes-hall")
 
 
 class CrossrefPacingTests(unittest.TestCase):

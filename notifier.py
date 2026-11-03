@@ -5,7 +5,7 @@ import logging
 import socket
 import urllib.request
 
-logger = logging.getLogger("Notifier")
+logger = logging.getLogger(__name__)
 
 
 def send_telegram_message(settings, text: str) -> bool:

@@ -4,7 +4,7 @@ import logging
 from datetime import date
 from typing import Optional
 
-logger = logging.getLogger("Utils")
+logger = logging.getLogger(__name__)
 
 
 def read_date(path: str) -> Optional[date]:

@@ -12,10 +12,9 @@ class Paper(NamedTuple):
     id: str              # Canonical arXiv identifier (for example, '2503.16215')
     title: str           # Paper title
     authors: List[str]   # List of author names
-    published: datetime  # First-version submission datetime (timezone-aware)
+    submitted: datetime  # First-version submission datetime (timezone-aware)
     summary: str         # Paper abstract/summary
     link: str            # Link to the abstract page
-    pdf_link: str        # Direct link to the PDF
     doi: Optional[str]   # DOI, if available
     journal_ref: Optional[str] # Journal reference, if available (e.g., "Phys. Rev. Lett. ...")
 

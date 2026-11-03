@@ -17,8 +17,7 @@ from notifier import send_telegram_message
 from settings import AppSettings
 from tracked_authors import (
     TrackedAuthorList,
-    expand_target_names,
-    find_matching_target_authors,
+    author_names_match,
     load_tracked_authors,
     new_website_author,
     save_tracked_authors,
@@ -32,7 +31,7 @@ EXCLUDED_SECTIONS = {"alumni"}
 # A redesign or a broken page should not look like "the group is empty".
 MIN_EXPECTED_MEMBERS = 10
 
-logger = logging.getLogger("MemberSync")
+logger = logging.getLogger(__name__)
 
 
 class WebsiteMember(NamedTuple):
@@ -109,11 +108,11 @@ def fetch_website_members(url: str) -> List[WebsiteMember]:
 
 def find_untracked_members(members: List[WebsiteMember], tracked: TrackedAuthorList) -> List[WebsiteMember]:
     """Returns website members that no tracked author (or ignored name) covers."""
-    tracked_names = expand_target_names(tracked) + tracked.ignored_website_names
+    known_names = tracked.all_names() + tracked.ignored_website_names
     return [
         member
         for member in members
-        if not find_matching_target_authors([member.name], tracked_names)
+        if not any(author_names_match(member.name, name) for name in known_names)
     ]
 
 

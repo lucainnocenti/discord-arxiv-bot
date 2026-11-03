@@ -10,10 +10,11 @@ import os
 import sys
 from logging.handlers import RotatingFileHandler
 
-from arxiv_source import ArxivSource
+from arxiv_api import ArxivApi
 from crossref import CrossrefClient
 from discord_webhook import WebhookSender
 from member_sync import sync_members_from_website
+from new_papers import NewPaperFinder
 from pipeline import Pipeline
 from publication_check import PublicationChecker
 from registry import PaperRegistry
@@ -82,11 +83,12 @@ async def _run(settings: AppSettings):
         settings.reload_tracked_authors()
 
     registry = PaperRegistry.load(settings.posted_papers_file, read_only=settings.no_save)
-    arxiv_source = ArxivSource(settings)
-    publications = PublicationChecker(arxiv_source, CrossrefClient(settings.crossref_mailto))
+    api = ArxivApi()
+    new_papers = NewPaperFinder(settings, api)
+    publications = PublicationChecker(api, CrossrefClient(settings.crossref_mailto))
     send = WebhookSender(settings.webhook_url) if settings.webhook_url else None
     try:
-        await Pipeline(settings, registry, arxiv_source, publications, send).run()
+        await Pipeline(settings, registry, new_papers, publications, send).run()
     finally:
         # Covers runs that fail midway; a no-op when nothing changed.
         registry.save()

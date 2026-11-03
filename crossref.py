@@ -25,11 +25,12 @@ CROSSREF_MAX_RETRY_AFTER_SECONDS = 60
 MIN_TITLE_SIMILARITY = 0.93
 TITLE_NORMALIZATION_PATTERN = re.compile(r'[^a-z0-9]+')
 
+logger = logging.getLogger(__name__)
+
 
 class CrossrefClient:
     def __init__(self, mailto: Optional[str] = None):
         self.mailto = mailto
-        self.logger = logging.getLogger(self.__class__.__name__)
         # Lookups run in executor threads, so pacing needs a lock.
         self._lock = threading.Lock()
         self._last_request = 0.0
@@ -54,7 +55,7 @@ class CrossrefClient:
         try:
             payload = self._get_json(f"{CROSSREF_API_URL}?{urllib.parse.urlencode(params)}")
         except Exception as e:
-            self.logger.warning(f"Crossref lookup failed for {paper.id}: {e}")
+            logger.warning(f"Crossref lookup failed for {paper.id}: {e}")
             return None
 
         items = payload.get("message", {}).get("items", [])
@@ -64,9 +65,9 @@ class CrossrefClient:
         for item in items:
             # Stop at the first high-confidence match; this path is meant to be
             # conservative, not exhaustive.
-            candidate = self.publication_from_item(paper, item)
+            candidate = publication_from_item(paper, item)
             if candidate:
-                self.logger.info(f"Crossref matched tracked paper {paper.id} to DOI {candidate.doi}.")
+                logger.info(f"Crossref matched tracked paper {paper.id} to DOI {candidate.doi}.")
                 return candidate
         return None
 
@@ -75,26 +76,10 @@ class CrossrefClient:
         try:
             payload = self._get_json(f"{CROSSREF_API_URL}/{urllib.parse.quote(doi)}")
         except Exception as e:
-            self.logger.warning(f"Crossref DOI lookup failed for {doi}: {e}")
+            logger.warning(f"Crossref DOI lookup failed for {doi}: {e}")
             return None
         item = payload.get("message")
         return item if isinstance(item, dict) else None
-
-    def publication_from_item(self, paper: Paper, item: Dict[str, Any]) -> Optional[Paper]:
-        """Validates a Crossref search hit and converts it into a publication update."""
-        if item.get("type") != "journal-article":
-            return None
-
-        doi = item.get("DOI")
-        titles = item.get("title", [])
-        if not isinstance(doi, str) or not titles:
-            return None
-
-        crossref_title = titles[0] if isinstance(titles[0], str) else ""
-        if not crossref_title or not is_probable_match(paper, crossref_title, item.get("author", [])):
-            return None
-
-        return merge_crossref_item(paper, item)
 
     def _get_json(self, url: str) -> Any:
         """
@@ -117,7 +102,7 @@ class CrossrefClient:
                 if e.code != 429 or attempt == 1:
                     raise
                 retry_after = _retry_after_seconds(e)
-                self.logger.info(f"Crossref rate limit hit; waiting {retry_after:.0f}s before retrying.")
+                logger.info(f"Crossref rate limit hit; waiting {retry_after:.0f}s before retrying.")
                 time.sleep(retry_after)
 
     def _user_agent(self) -> str:
@@ -125,6 +110,23 @@ class CrossrefClient:
         if self.mailto:
             return f"arxiv-discord-bot/1.0 (mailto:{self.mailto})"
         return "arxiv-discord-bot/1.0"
+
+
+def publication_from_item(paper: Paper, item: Dict[str, Any]) -> Optional[Paper]:
+    """Validates a Crossref search hit and converts it into a publication update."""
+    if item.get("type") != "journal-article":
+        return None
+
+    doi = item.get("DOI")
+    titles = item.get("title", [])
+    if not isinstance(doi, str) or not titles:
+        return None
+
+    crossref_title = titles[0] if isinstance(titles[0], str) else ""
+    if not crossref_title or not is_probable_match(paper, crossref_title, item.get("author", [])):
+        return None
+
+    return merge_crossref_item(paper, item)
 
 
 def is_probable_match(paper: Paper, crossref_title: str, crossref_authors: Any) -> bool:

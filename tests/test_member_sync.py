@@ -14,8 +14,6 @@ from tracked_authors import (
     WEBSITE_SOURCE,
     TrackedAuthor,
     TrackedAuthorList,
-    expand_discord_ids,
-    expand_target_names,
     load_tracked_authors,
     save_tracked_authors,
 )
@@ -92,16 +90,16 @@ class TrackedAuthorFileTests(unittest.TestCase):
 
     def test_names_are_canonical_plus_explicit_variations(self):
         tracked = TrackedAuthorList(authors=[TrackedAuthor("Dana Holt", variations=["Dana A. Holt"])])
-        self.assertEqual(expand_target_names(tracked), ["Dana Holt", "Dana A. Holt"])
+        self.assertEqual(tracked.all_names(), ["Dana Holt", "Dana A. Holt"])
 
-    def test_discord_ids_cover_name_variations(self):
+    def test_variation_finds_the_author_with_their_discord_id(self):
         tracked = TrackedAuthorList(authors=[
             TrackedAuthor("Alice Example", variations=["Alice B. Example"], discord_id=7),
             TrackedAuthor("Bob Example"),
         ])
         save_tracked_authors(self.path, tracked)
-        ids = expand_discord_ids(load_tracked_authors(self.path))
-        self.assertEqual(ids, {"Alice Example": 7, "Alice B. Example": 7})
+        found = load_tracked_authors(self.path).found_in(["Alice B. Example"])
+        self.assertEqual([(a.name, a.discord_id) for a in found], [("Alice Example", 7)])
 
 
 class SyncFlowTests(unittest.TestCase):

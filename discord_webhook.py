@@ -19,7 +19,7 @@ MAX_RATE_LIMIT_WAIT_SECONDS = 30
 # well below the webhook rate limit.
 SEND_INTERVAL_SECONDS = 1
 
-logger = logging.getLogger("DiscordWebhook")
+logger = logging.getLogger(__name__)
 
 
 class WebhookSender:

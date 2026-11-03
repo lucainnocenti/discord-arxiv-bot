@@ -12,18 +12,16 @@ bot itself never does. Don't run it while the bot is running.
 
 import argparse
 import json
-import os
 import sys
 from dataclasses import asdict
 
 from registry import PaperRegistry
-
-REGISTRY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "posted_papers.txt")
+from settings import AppSettings
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Inspect and fix the tracked-paper registry.")
-    parser.add_argument("--registry", default=REGISTRY_PATH, help="Registry file (default: posted_papers.txt next to the bot).")
+    parser.add_argument("--registry", default=AppSettings().posted_papers_file, help="Registry file (default: posted_papers.txt next to the bot).")
     commands = parser.add_subparsers(dest="command", required=True)
 
     show = commands.add_parser("show", help="Print one record.")

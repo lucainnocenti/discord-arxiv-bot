@@ -10,13 +10,14 @@ from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from arxiv_source import RETRY_DELAYS_SECONDS, ArxivSource
-from crossref import CrossrefClient, choose_better_journal_ref, format_journal_ref
+from arxiv_api import RETRY_DELAYS_SECONDS, ArxivApi
+from crossref import CrossrefClient, choose_better_journal_ref, format_journal_ref, publication_from_item
 from discord_formatter import format_new_paper, format_publication
 from models import Paper
 from publication_check import PublicationChecker
 from registry import PaperRecord, PaperRegistry
 from settings import AppSettings
+from tracked_authors import TrackedAuthor, TrackedAuthorList
 
 
 @contextmanager
@@ -29,12 +30,16 @@ def workspace_tempdir():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def tracked(*authors) -> TrackedAuthorList:
+    """A tracked-author list; plain strings become authors without extras."""
+    return TrackedAuthorList([TrackedAuthor(a) if isinstance(a, str) else a for a in authors])
+
+
+DEFAULT_AUTHORS = tracked(TrackedAuthor("Alice Example", discord_id=12345), "Bob Example")
+
+
 def make_settings(script_dir: str, **overrides) -> AppSettings:
-    values = dict(
-        target_authors=["Alice Example", "Bob Example"],
-        author_discord_ids={"Alice Example": 12345},
-        script_dir=script_dir,
-    )
+    values = dict(authors=DEFAULT_AUTHORS, script_dir=script_dir)
     values.update(overrides)
     return AppSettings(**values)
 
@@ -44,10 +49,9 @@ def make_paper(**overrides) -> Paper:
         "id": "2603.99999",
         "title": "A Useful Quantum Paper",
         "authors": ["Alice Example", "Bob Example"],
-        "published": datetime(2026, 3, 1, tzinfo=ZoneInfo("UTC")),
+        "submitted": datetime(2026, 3, 1, tzinfo=ZoneInfo("UTC")),
         "summary": "Short abstract.",
         "link": "https://arxiv.org/abs/2603.99999",
-        "pdf_link": "https://arxiv.org/pdf/2603.99999",
         "doi": None,
         "journal_ref": None,
     }
@@ -56,12 +60,12 @@ def make_paper(**overrides) -> Paper:
 
 
 def make_checker(settings: AppSettings, papers=(), failed_ids=()) -> PublicationChecker:
-    checker = PublicationChecker(ArxivSource(settings), CrossrefClient())
+    checker = PublicationChecker(ArxivApi(), CrossrefClient())
 
     async def fake_fetch(_paper_ids):
         return list(papers), list(failed_ids)
 
-    checker.arxiv.fetch_by_ids = fake_fetch  # type: ignore[method-assign]
+    checker.api.fetch_by_ids = fake_fetch  # type: ignore[method-assign]
     return checker
 
 
@@ -136,52 +140,59 @@ class RegistryTests(unittest.TestCase):
 
 class FormatterTests(unittest.TestCase):
     def test_format_publication_message_includes_doi(self):
-        with workspace_tempdir() as tmpdir:
-            paper = make_paper(doi="10.1000/example", journal_ref="Journal of Tests")
-            message = format_publication(paper, make_settings(tmpdir))
+        paper = make_paper(doi="10.1000/example", journal_ref="Journal of Tests")
+        message = format_publication(paper, DEFAULT_AUTHORS)
 
-            self.assertIsNotNone(message)
-            self.assertIn("was published! Cheers!", message)
-            self.assertIn("https://doi.org/10.1000/example", message)
-            self.assertIn("New journal reference", message)
-            self.assertIn("Journal of Tests", message)
+        self.assertIsNotNone(message)
+        self.assertIn("was published! Cheers!", message)
+        self.assertIn("https://doi.org/10.1000/example", message)
+        self.assertIn("New journal reference", message)
+        self.assertIn("Journal of Tests", message)
 
     def test_format_message_mentions_canonical_author_for_initial_variant(self):
-        with workspace_tempdir() as tmpdir:
-            settings = make_settings(
-                tmpdir,
-                target_authors=["Carla Bianca Rossi", "C. Bianca Rossi", "C Bianca Rossi"],
-                author_discord_ids={"Carla Bianca Rossi": 54321, "C. Bianca Rossi": 54321, "C Bianca Rossi": 54321},
-            )
-            message = format_new_paper(make_paper(authors=["Carla B. Rossi", "Bob Example"]), settings)
+        authors = tracked(TrackedAuthor("Carla Bianca Rossi", variations=["C. Bianca Rossi"], discord_id=54321))
+        message = format_new_paper(make_paper(authors=["Carla B. Rossi", "Bob Example"]), authors)
 
-            self.assertIsNotNone(message)
-            self.assertIn("**New paper by <@54321>**", message)
-            self.assertNotIn("tracked authors", message)
-            self.assertEqual(message.count("<@54321>"), 1)
+        self.assertIsNotNone(message)
+        self.assertIn("**New paper by <@54321>**", message)
+        self.assertNotIn("tracked authors", message)
+        self.assertEqual(message.count("<@54321>"), 1)
+
+    def test_one_person_is_mentioned_once_under_two_spellings(self):
+        authors = tracked(TrackedAuthor("Dana Holt", variations=["Dana A. Holt"], discord_id=7), "Bob Example", "Eve Example")
+        paper = make_paper(authors=["Dana Holt", "Bob Example", "D. A. Holt", "Eve Example"])
+        message = format_new_paper(paper, authors)
+        self.assertIn("**New paper by <@7>, Bob Example, and Eve Example**", message)
+
+    def test_paper_without_tracked_authors_names_none(self):
+        message = format_new_paper(make_paper(authors=["Someone Else"]), DEFAULT_AUTHORS)
+        self.assertIn("**New paper by tracked authors**", message)
 
 
 class AuthorMatchTests(unittest.TestCase):
     def test_accepts_middle_initial_variants(self):
-        with workspace_tempdir() as tmpdir:
-            source = ArxivSource(make_settings(tmpdir, target_authors=["Carla Bianca Rossi", "C. Bianca Rossi", "C Bianca Rossi"]))
-            self.assertTrue(source.is_author_match(["Carla B. Rossi", "Coauthor Example"]))
+        authors = tracked("Carla Bianca Rossi")
+        self.assertTrue(authors.found_in(["Carla B. Rossi", "Coauthor Example"]))
+        self.assertTrue(authors.found_in(["C. B. Rossi"]))
 
     def test_rejects_different_full_name_matching_initial_alias(self):
-        with workspace_tempdir() as tmpdir:
-            source = ArxivSource(make_settings(tmpdir, target_authors=["Sebastian Kor", "S. Kor", "S Kor"]))
-            self.assertFalse(source.is_author_match(["Sebastien Kor", "Coauthor Example"]))
-            self.assertTrue(source.is_author_match(["S. Kor", "Coauthor Example"]))
+        authors = tracked(TrackedAuthor("Sebastian Kor", variations=["S. Kor"]))
+        self.assertFalse(authors.found_in(["Sebastien Kor", "Coauthor Example"]))
+        self.assertTrue(authors.found_in(["S. Kor", "Coauthor Example"]))
+
+    def test_found_in_returns_people_in_paper_order(self):
+        authors = tracked("Alice Example", "Bob Example")
+        alice, bob = authors.authors
+        self.assertEqual(authors.found_in(["B. Example", "Someone", "Alice Example"]), [bob, alice])
 
 
 class CrossrefMatchingTests(unittest.TestCase):
     def test_match_requires_close_title_and_author(self):
-        client = CrossrefClient()
         paper = make_paper()
         base = {"type": "journal-article", "title": ["A Useful Quantum Paper"], "container-title": ["Quantum Journal"]}
 
-        matched = client.publication_from_item(paper, {**base, "DOI": "10.3000/article", "author": [{"family": "Example"}]})
-        rejected = client.publication_from_item(paper, {**base, "DOI": "10.3000/wrong", "author": [{"family": "Different"}]})
+        matched = publication_from_item(paper, {**base, "DOI": "10.3000/article", "author": [{"family": "Example"}]})
+        rejected = publication_from_item(paper, {**base, "DOI": "10.3000/wrong", "author": [{"family": "Different"}]})
 
         self.assertIsNotNone(matched)
         self.assertEqual(matched.doi, "10.3000/article")
@@ -248,29 +259,25 @@ class PublicationCheckTests(unittest.TestCase):
 
 class ArxivRefreshTests(unittest.TestCase):
     def test_transient_failure_is_retried_then_reported_as_failed(self):
-        with workspace_tempdir() as tmpdir:
-            source = ArxivSource(make_settings(tmpdir))
+        api = ArxivApi()
+        with patch.object(api.client, "results", side_effect=Exception("HTTP 429")) as mock_results:
+            with patch("arxiv_api.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+                papers, failed_ids = asyncio.run(api.fetch_by_ids(["2603.99999"]))
 
-            with patch.object(source.client, "results", side_effect=Exception("HTTP 429")) as mock_results:
-                with patch("arxiv_source.asyncio.sleep", new=AsyncMock()) as mock_sleep:
-                    papers, failed_ids = asyncio.run(source.fetch_by_ids(["2603.99999"]))
-
-            self.assertEqual(papers, [])
-            self.assertEqual(failed_ids, ["2603.99999"])
-            self.assertEqual(mock_results.call_count, 3)
-            self.assertEqual([call.args[0] for call in mock_sleep.await_args_list], list(RETRY_DELAYS_SECONDS))
+        self.assertEqual(papers, [])
+        self.assertEqual(failed_ids, ["2603.99999"])
+        self.assertEqual(mock_results.call_count, 3)
+        self.assertEqual([call.args[0] for call in mock_sleep.await_args_list], list(RETRY_DELAYS_SECONDS))
 
     def test_failed_chunk_stops_the_refresh(self):
-        with workspace_tempdir() as tmpdir:
-            source = ArxivSource(make_settings(tmpdir))
-            ids = [f"2603.{n:05d}" for n in range(15)]
+        api = ArxivApi()
+        ids = [f"2603.{n:05d}" for n in range(15)]
+        with patch.object(api.client, "results", side_effect=Exception("HTTP 400")) as mock_results:
+            papers, failed_ids = asyncio.run(api.fetch_by_ids(ids))
 
-            with patch.object(source.client, "results", side_effect=Exception("HTTP 400")) as mock_results:
-                papers, failed_ids = asyncio.run(source.fetch_by_ids(ids))
-
-            self.assertEqual(papers, [])
-            self.assertEqual(failed_ids, ids)
-            mock_results.assert_called_once()
+        self.assertEqual(papers, [])
+        self.assertEqual(failed_ids, ids)
+        mock_results.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()
