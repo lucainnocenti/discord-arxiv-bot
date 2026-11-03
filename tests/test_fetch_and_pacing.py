@@ -80,6 +80,38 @@ class RecentPapersTests(unittest.TestCase):
         self.assertEqual(len(seen_since), 1)
         self.assertEqual(covered, MONDAY)
 
+    def test_empty_or_unreadable_feed_notifies_when_falling_back(self):
+        for rss in ({"feed": RssFeed(TUESDAY, [])}, {"feed_error": True}):
+            with self.subTest(rss=rss), patch.object(arxiv_source, "send_telegram_message", return_value=False) as notify:
+                _, searches, _ = self.run_search(last_covered=MONDAY, **rss)
+                self.assertEqual(len(searches), 1)
+                notify.assert_called_once()
+                message = notify.call_args.args[1]
+                self.assertIn("Falling back to the arXiv API", message)
+                self.assertIn("quant-ph", message)
+
+    def test_no_rss_failure_alert_for_healthy_feeds_or_rss_only(self):
+        cases = [
+            dict(feed=RssFeed(TUESDAY, [make_paper()]), last_covered=MONDAY),
+            dict(feed=RssFeed(TUESDAY, [make_paper(authors=["Someone Else"])]), last_covered=MONDAY),
+            dict(feed=RssFeed(TUESDAY, [make_paper()]), last_covered=THURSDAY),
+            dict(feed=RssFeed(TUESDAY, [make_paper()]), last_covered=MONDAY, force_api=True),
+            dict(feed=RssFeed(TUESDAY, []), rss_only=True),
+        ]
+        for case in cases:
+            with self.subTest(case=case), patch.object(arxiv_source, "send_telegram_message") as notify:
+                self.run_search(**case)
+                notify.assert_not_called()
+
+    def test_dry_run_does_not_deliver_fallback_notification(self):
+        with patch("notifier.urllib.request.urlopen") as request:
+            _, searches, _ = self.run_search(
+                feed=RssFeed(TUESDAY, []), no_send=True, no_save=True,
+                telegram_bot_token="test-token", telegram_chat_id="123",
+            )
+            self.assertEqual(len(searches), 1)
+            request.assert_not_called()
+
     def test_incomplete_api_search_leaves_the_gap_open(self):
         _, _, covered = self.run_search(feed=RssFeed(MONDAY, [make_paper()]), last_covered=THURSDAY, api_complete=False)
         self.assertEqual(covered, THURSDAY)

@@ -89,3 +89,8 @@ Don't edit the registry while the bot is running.
 | `dms_handler.py` | Separate Discord bot for DM forwarding and channel commands |
 
 Run the tests with `python -m pytest`.
+
+When an empty or unreadable RSS feed triggers the API search, the bot sends a
+Telegram alert using `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. Healthy feeds
+with no matching authors do not trigger this alert. `--rss` suppresses the API
+fallback and its alert; `--nosend` previews the alert without sending it.

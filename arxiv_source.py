@@ -4,12 +4,14 @@ day, API search for missed days) and refreshes metadata for known papers."""
 import asyncio
 import logging
 import re
+import socket
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import arxiv # Library for interacting with the arXiv API
 
 from models import FetchPapersByIdResult, Paper, canonicalize_paper_id, clean_optional_text
+from notifier import send_telegram_message
 from rss_source import RssFeed, fetch_rss_feed, previous_announcement_day, read_last_covered, write_last_covered
 from settings import AppSettings
 from utils import find_matching_target_authors
@@ -63,6 +65,14 @@ class ArxivSource:
         elif gap:
             since = self._api_window_start(last_covered)
             self.logger.info(f"Running the API search because {gap}: papers submitted since {since:%Y-%m-%d %H:%M} UTC.")
+            if not feed_has_papers:
+                await asyncio.to_thread(
+                    send_telegram_message,
+                    self.settings,
+                    f"arxiv-bot on {socket.gethostname()}: {gap}. "
+                    f"Falling back to the arXiv API for {self.settings.category} papers "
+                    f"submitted since {since:%Y-%m-%d %H:%M} UTC.",
+                )
             api_papers, api_complete = await self._search_since(since)
             known_ids = {paper.id for paper in candidates}
             candidates += [paper for paper in api_papers if paper.id not in known_ids]
