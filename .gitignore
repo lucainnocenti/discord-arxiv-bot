@@ -15,3 +15,6 @@ posted_papers.txt
 playground.ipynb
 tracked_authors.json
 last_member_sync.txt
+logs/
+run.lock
+*.tmp

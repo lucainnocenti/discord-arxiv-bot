@@ -38,7 +38,7 @@ def format_paper_message(paper: Paper, settings: AppSettings, event_type: str = 
         "**New paper by {target_authors}**\n"
         "**Title:** {title}\n"
         "**Authors:** {authors_str}\n"
-        "**Announced:** {published_date}\n"
+        "**Submitted:** {published_date}\n"
         "**Abstract:** {summary}\n"
         "{journal_ref_line}"
         "{doi_line}"

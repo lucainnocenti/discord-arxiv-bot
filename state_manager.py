@@ -1,14 +1,13 @@
-"""Persistence helpers for the bot's posting cursors and tracked-paper registry."""
+"""Persistence helpers for the tracked-paper registry."""
 
 import json
 import os
 import logging
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, date
-from zoneinfo import ZoneInfo
-from typing import Dict, List, Optional, Set
+from datetime import date
+from typing import Dict, Iterable, List, Optional, Set
 
-from settings import AppSettings, EASTERN_TZ # Import shared settings and constants
+from settings import AppSettings
 from arxiv_fetcher import canonicalize_paper_id
 
 
@@ -22,6 +21,8 @@ class PaperRecord:
     journal_ref: Optional[str] = None
     title: Optional[str] = None
     authors: List[str] = field(default_factory=list)
+    # ISO date of the last Crossref publication lookup (see publication_schedule.py).
+    crossref_checked: Optional[str] = None
 
 class StateManager:
     def __init__(self, settings: AppSettings):
@@ -58,6 +59,7 @@ class StateManager:
                         journal_ref=record.journal_ref or existing.journal_ref,
                         title=record.title or existing.title,
                         authors=record.authors or existing.authors,
+                        crossref_checked=max(filter(None, (record.crossref_checked, existing.crossref_checked)), default=None),
                     )
 
             logging.info(f"Loaded {len(registry)} tracked paper records from {file_path}")
@@ -113,6 +115,7 @@ class StateManager:
             journal_ref=journal_ref or current.journal_ref,
             title=title or current.title,
             authors=cleaned_authors or list(current.authors),
+            crossref_checked=current.crossref_checked,
         )
         registry[canonical_paper_id] = updated
 
@@ -127,98 +130,18 @@ class StateManager:
         )
         return updated
 
-    def get_last_api_check_time(self) -> datetime:
-        """Reads the last API check date from file or returns a default."""
-        if self.settings.last_date_override:
-            logging.info(f"Using override date for API check: {self.settings.last_date_override}")
-            return self.settings.last_date_override
-
-        file_path = self.settings.last_submission_file
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, 'r') as f:
-                    date_str = f.read().strip()
-                    dt = datetime.fromisoformat(date_str)
-                    logging.info(f"Read last API check date from file: {dt}")
-                    return dt
-            except Exception as e:
-                logging.error(f"Error reading last API check date from {file_path}: {e}. Using default (yesterday).")
-                return self._default_past_date()
-        else:
-            logging.warning(f"{file_path} not found. Using default last check date (yesterday).")
-            # Optionally create the file with the default date here if desired
-            # self.save_last_api_check_time(self._default_past_date())
-            return self._default_past_date()
-
-    def save_last_api_check_time(self, time: datetime):
-        """Saves the API check time to file."""
+    def mark_crossref_checked(self, paper_ids: Iterable[str], checked_on: date) -> Dict[str, PaperRecord]:
+        """Records a Crossref lookup date for several papers with a single file write."""
+        registry = self.get_paper_registry()
+        for paper_id in paper_ids:
+            canonical_paper_id = canonicalize_paper_id(paper_id)
+            if canonical_paper_id in registry:
+                registry[canonical_paper_id].crossref_checked = checked_on.isoformat()
         if self.settings.no_save:
-            logging.info("Skipping save of last API check time (--nosave).")
-            return
-
-        file_path = self.settings.last_submission_file
-        try:
-            # Add a small delta to avoid reprocessing the exact same timestamp
-            # on the next inclusive arXiv API query.
-            save_time = time + timedelta(seconds=1)
-            with open(file_path, 'w') as f:
-                f.write(save_time.isoformat())
-            logging.info(f"Saved last API check time {save_time.isoformat()} to {file_path}")
-        except Exception as e:
-            logging.error(f"Error saving last API check time to {file_path}: {e}")
-
-    def _get_last_rss_check_date_from_file(self) -> Optional[date]:
-        """Reads the last RSS check date from its file."""
-        file_path = self.settings.last_rss_check_file
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, 'r') as f:
-                    date_str = f.read().strip()
-                    return datetime.fromisoformat(date_str).date()
-            except Exception as e:
-                logging.error(f"Error reading last RSS check date from {file_path}: {e}")
-        return None # Indicate file not found or error
-
-    def has_checked_rss_today(self) -> bool:
-        """Checks if the RSS feed was already checked today (ET)."""
-        if self.settings.force_rss_check:
-            logging.info("Forcing RSS check (--forcerss).")
-            return False
-
-        last_check_date = self._get_last_rss_check_date_from_file()
-        if last_check_date is None:
-             logging.info(f"{self.settings.last_rss_check_file} not found or unreadable. Assuming RSS not checked today.")
-             return False # Treat as not checked if file missing/error
-
-        # The arXiv RSS feed is published on an Eastern Time cadence, so use the
-        # same timezone when deciding whether "today's" poll already ran.
-        current_date_et = datetime.now(EASTERN_TZ).date()
-        has_checked = last_check_date == current_date_et
-        if has_checked:
-            logging.info(f"RSS feed already checked today ({current_date_et}).")
+            logging.info("Skipping save of Crossref check dates (--nosave).")
         else:
-            logging.info(f"RSS feed not yet checked today ({current_date_et}). Last check was {last_check_date}.")
-        return has_checked
-
-    def save_rss_check_time(self):
-        """Saves the current time (ET) as the last RSS check time."""
-        if self.settings.no_save:
-            logging.info("Skipping save of RSS check time (--nosave).")
-            return
-
-        file_path = self.settings.last_rss_check_file
-        try:
-            now_et = datetime.now(EASTERN_TZ)
-            with open(file_path, 'w') as f:
-                f.write(now_et.isoformat())
-            logging.info(f"Saved current RSS check time {now_et.isoformat()} to {file_path}")
-        except Exception as e:
-            logging.error(f"Error saving RSS check time to {file_path}: {e}")
-
-    def _default_past_date(self) -> datetime:
-        """Returns a datetime object for yesterday."""
-        # Use timezone-naive datetime for comparison with arXiv's naive datetimes
-        return datetime.now() - timedelta(days=1)
+            self._write_paper_registry(registry)
+        return registry
 
     def _parse_registry_line(self, line: str) -> tuple[Optional[str], PaperRecord]:
         """Parses a registry line supporting both legacy IDs and JSON records."""
@@ -240,6 +163,7 @@ class StateManager:
                         for author in data.get("authors", [])
                         if isinstance(author, str)
                     ] if isinstance(data.get("authors"), list) else [],
+                    crossref_checked=data.get("crossref_checked") if isinstance(data.get("crossref_checked"), str) else None,
                 )
             except Exception as e:
                 logging.warning(f"Skipping unreadable tracked-paper record '{line}': {e}")
@@ -252,13 +176,17 @@ class StateManager:
     def _write_paper_registry(self, registry: Dict[str, PaperRecord]):
         """Writes the registry back to disk in a deterministic JSON-lines format."""
         file_path = self.settings.posted_papers_file
+        # Write to a temp file and swap it in, so a crash (or the sync client
+        # grabbing the file mid-write) never leaves a truncated registry.
+        tmp_path = f"{file_path}.tmp"
         try:
-            with open(file_path, 'w', encoding='utf-8') as f:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 # Sort by canonical paper ID so diffs stay stable across runs.
                 for paper_id in sorted(registry):
                     record = registry[paper_id]
                     payload = {"id": paper_id, **asdict(record)}
                     f.write(json.dumps(payload, sort_keys=True))
                     f.write("\n")
+            os.replace(tmp_path, file_path)
         except Exception as e:
             logging.error(f"Error saving tracked paper registry to {file_path}: {e}")

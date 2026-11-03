@@ -3,16 +3,23 @@
 import discord
 import asyncio
 import logging
+import os
 import sys
-from datetime import datetime
+from datetime import date
+from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Set
 
 # Import the structured components
-from settings import load_settings, AppSettings, API_SOURCE, RSS_SOURCE
+from settings import load_settings, AppSettings
 from state_manager import PaperRecord, StateManager
 from arxiv_fetcher import ArxivFetcher, Paper, TrackedPaperMetadata
 from discord_formatter import format_paper_message
 from member_sync import sync_members_from_website
+from publication_schedule import is_crossref_check_due
+from run_lock import LockHeldElsewhere, run_lock
+
+LOG_MAX_BYTES = 1_000_000
+LOG_BACKUP_COUNT = 5
 
 def setup_logging(log_path: str):
     """Configures logging to file and console."""
@@ -25,7 +32,9 @@ def setup_logging(log_path: str):
     # Remove any handlers that libraries (e.g. arxiv, feedparser) may have
     # added before this function runs — basicConfig() would be a no-op otherwise.
     root.handlers.clear()
-    fh = logging.FileHandler(log_path)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    # Rotate so the log never grows unbounded: ~1 MB per file, 5 old files kept.
+    fh = RotatingFileHandler(log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
     fh.setFormatter(fmt)
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
@@ -77,23 +86,13 @@ class ArxivBotClient(discord.Client):
         self.logger.info(f"Operating in channel: {channel.name} ({channel.id})")
 
         # --- Fetching ---
-        # API mode uses a timestamp cursor; RSS mode is a daily poll because the
-        # feed is already a small rolling window rather than a full history.
-        last_api_check_time = self.state_manager.get_last_api_check_time()
-
-        # RSS is polled at most once per day because the feed is a rolling window.
-        # API mode instead uses the last-submission timestamp as its incremental cursor.
-        if self.settings.source == RSS_SOURCE and self.state_manager.has_checked_rss_today():
-             self.logger.info("RSS source selected, but already checked today. No fetch needed.")
-             papers_to_post = []
-        else:
-            try:
-                # Pass the relevant date only if using API source
-                papers_to_post = await self.fetcher.fetch_latest_papers(last_api_check_time)
-                # print(papers_to_post)  # Debugging line to see fetched papers
-            except Exception as e:
-                 self.logger.exception(f"Failed to fetch papers: {e}")
-                 papers_to_post = [] # Ensure it's an empty list on fetch failure
+        # Every run looks at a rolling window of recent submissions; the
+        # registry below decides what is actually new, so no cursor is needed.
+        try:
+            papers_to_post = await self.fetcher.fetch_latest_papers()
+        except Exception as e:
+            self.logger.exception(f"Failed to fetch papers: {e}")
+            papers_to_post = [] # Ensure it's an empty list on fetch failure
 
         # --- Processing and Posting ---
         # This first loop handles brand-new preprints only. Publication updates
@@ -101,21 +100,23 @@ class ArxivBotClient(discord.Client):
         papers_posted_count = 0
         publication_updates_count = 0
         publication_check_degraded = False
-        latest_paper_time: Optional[datetime] = None # Keep track for saving API state
 
         for paper in papers_to_post:
             if paper.id in self.posted_in_this_run:
                 self.logger.info(f"Paper {paper.id} already processed in this run, skipping.")
                 continue
 
-            # Enrich before deciding whether to post so the initial announcement
-            # already includes DOI/journal data when arXiv or Crossref has it.
-            paper = await self.fetcher.enrich_publication_metadata(paper)
+            # The fetch window overlaps earlier runs, so most papers here were
+            # already posted; check that before spending any Crossref calls.
             paper_record = self.paper_registry.get(paper.id, PaperRecord())
             if paper_record.posted:
                 self.logger.info(f"Paper {paper.id} was already posted in a previous run, skipping.")
                 self.posted_in_this_run.add(paper.id)
                 continue
+
+            # Enrich before posting so the initial announcement already
+            # includes DOI/journal data when arXiv or Crossref has it.
+            paper = await self.fetcher.enrich_publication_metadata(paper)
 
             self.logger.info(f"Processing paper: '{paper.title}' ({paper.id})")
 
@@ -130,17 +131,6 @@ class ArxivBotClient(discord.Client):
                     published=bool(paper.journal_ref or paper.doi),
                 )
                 self.paper_registry[paper.id] = record
-
-                if self.settings.source == API_SOURCE:
-                    # Advance the API cursor to the newest published timestamp we
-                    # actually processed so the next run stays incremental.
-                    paper_published_naive = paper.published.replace(tzinfo=None)
-                    if latest_paper_time is None:
-                        latest_paper_time = paper.published
-                    else:
-                        current_latest = latest_paper_time.replace(tzinfo=None)
-                        if paper_published_naive > current_latest:
-                            latest_paper_time = paper.published
             elif send_result is False:
                 self.logger.warning(f"Skipping paper '{paper.title}' because message formatting failed (likely too long).")
                 self.posted_in_this_run.add(paper.id)
@@ -170,23 +160,6 @@ class ArxivBotClient(discord.Client):
                     "Publication checks completed with gaps because some tracked papers "
                     "could not be refreshed from arXiv this run."
                 )
-
-        # --- State Saving ---
-        # Persist cursors after the posting logic finishes so a failed Discord
-        # send does not silently move the checkpoint past an unsent paper.
-        if self.settings.source == API_SOURCE and latest_paper_time:
-            # Save the timestamp of the *latest* paper found in this batch
-             self.logger.info(f"Latest paper time found for API source: {latest_paper_time}")
-             self.state_manager.save_last_api_check_time(latest_paper_time)
-        elif self.settings.source == RSS_SOURCE:
-             # Save RSS check time if we performed a check (didn't skip due to already checked)
-             # and the feed actually had content. A failed or empty fetch must not
-             # consume today's slot, or a late arXiv announcement is never seen.
-             if not self.state_manager.has_checked_rss_today() or self.settings.force_rss_check:
-                 if self.fetcher.last_rss_fetch_complete:
-                     self.state_manager.save_rss_check_time()
-                 else:
-                     self.logger.warning("RSS fetch failed or feed was empty; not marking RSS as checked today.")
 
     async def _hydrate_incomplete_paper_records(self) -> tuple[int, bool]:
         """Backfills title/author metadata for legacy or sparse registry records."""
@@ -250,7 +223,16 @@ class ArxivBotClient(discord.Client):
             self.logger.info("No tracked unpublished papers require publication checks.")
             return 0, False
 
-        self.logger.info(f"Checking publication status for {len(tracked_ids)} tracked papers.")
+        today = date.today()
+        crossref_due_ids = {
+            paper_id
+            for paper_id, record in tracked_records.items()
+            if is_crossref_check_due(paper_id, record.crossref_checked, today)
+        }
+        self.logger.info(
+            f"Checking publication status for {len(tracked_ids)} tracked papers "
+            f"(Crossref lookup due for {len(crossref_due_ids)})."
+        )
         try:
             refresh_result = await self.fetcher.fetch_publication_updates(
                 tracked_ids,
@@ -263,10 +245,17 @@ class ArxivBotClient(discord.Client):
                     )
                     for paper_id, record in tracked_records.items()
                 },
+                crossref_due_ids=crossref_due_ids,
             )
         except Exception as e:
             self.logger.exception(f"Failed to refresh publication metadata: {e}")
             return 0, True
+
+        if refresh_result.crossref_checked_ids:
+            # Restart each looked-up paper's schedule; one registry write for all.
+            self.paper_registry = self.state_manager.mark_crossref_checked(
+                refresh_result.crossref_checked_ids, today
+            )
 
         if refresh_result.degraded:
             self.logger.warning(
@@ -351,25 +340,19 @@ async def run_bot():
         settings = load_settings() # Parse command line arguments once into a typed settings object.
         setup_logging(settings.log_path) # Setup logging early so downstream startup failures are captured.
         logging.info("Configuration loaded successfully.")
-        logging.info(f"Running with source: {settings.source}, Test Channel: {settings.use_test_channel}, No Save: {settings.no_save}, No Send: {settings.no_send}")
+        logging.info(f"Running with lookback: {settings.lookback_days} days, Test Channel: {settings.use_test_channel}, No Save: {settings.no_save}, No Send: {settings.no_send}")
+        if settings.ignored_flags:
+            logging.warning(f"Ignoring retired flags {', '.join(settings.ignored_flags)}; papers are found with a rolling --days window now.")
 
-        # The runtime is deliberately split into state, fetch, and Discord
-        # layers so each concern can be tested or changed independently.
-        state_manager = StateManager(settings)
+        # Dry runs write no state, so they neither need nor take the lock.
+        if settings.no_save:
+            await _run(settings)
+        else:
+            with run_lock(settings.run_lock_file):
+                await _run(settings)
 
-        # Weekly: pick up new group members before fetching so they count today.
-        added_authors = await asyncio.to_thread(sync_members_from_website, settings)
-        if added_authors:
-            settings.reload_tracked_authors()
-
-        fetcher = ArxivFetcher(settings)
-        # Formatter is functional, no class needed unless it grows state
-
-        bot = ArxivBotClient(settings=settings, state_manager=state_manager, fetcher=fetcher)
-
-        async with bot:
-            await bot.start(settings.discord_token, reconnect=False)
-
+    except LockHeldElsewhere as e:
+        logging.warning(f"{e} Skipping this run.")
     except ValueError as e:
          logging.error(f"Configuration error: {e}")
          # No need to setup full logging if basic config fails
@@ -388,6 +371,24 @@ async def run_bot():
          sys.exit(1)
     finally:
         logging.info("Bot process finished.")
+
+
+async def _run(settings: AppSettings):
+    """Runs one check: member sync, then the Discord session that posts papers."""
+    # The runtime is deliberately split into state, fetch, and Discord
+    # layers so each concern can be tested or changed independently.
+    state_manager = StateManager(settings)
+
+    # Weekly: pick up new group members before fetching so they count today.
+    added_authors = await asyncio.to_thread(sync_members_from_website, settings)
+    if added_authors:
+        settings.reload_tracked_authors()
+
+    fetcher = ArxivFetcher(settings)
+    bot = ArxivBotClient(settings=settings, state_manager=state_manager, fetcher=fetcher)
+
+    async with bot:
+        await bot.start(settings.discord_token, reconnect=False)
 
 
 if __name__ == "__main__":

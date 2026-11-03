@@ -1,30 +1,27 @@
 # arxiv_fetcher.py
 """
-Handles fetching and normalizing paper data from the arXiv service,
-supporting both the official API and the RSS feed.
+Handles fetching and normalizing paper data from the arXiv API, plus
+publication-metadata lookups on arXiv and Crossref.
 """
 
 import asyncio
 import arxiv # Library for interacting with the arXiv API
-import feedparser # Library for parsing RSS/Atom feeds
 import json
 import logging
 import re
+import threading
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo # For timezone handling (especially UTC and ET)
-import time # Needed for type hinting time.struct_time from feedparser
-from typing import List, Dict, Any, NamedTuple, Optional, cast, Tuple # For type hinting
+from typing import List, Dict, Any, NamedTuple, Optional, Set, Tuple # For type hinting
 
 # Import settings and utilities from other modules in the project
-from settings import AppSettings, API_SOURCE, RSS_SOURCE
+from settings import AppSettings
 from utils import decode_author_name, find_matching_target_authors
-
-# How far back the API fallback looks when the RSS feed is empty: covers a
-# weekend plus one skipped mailing.
-RSS_FALLBACK_LOOKBACK_DAYS = 4
 
 # Define a standard structure for paper data returned by the fetcher.
 # Using NamedTuple provides immutability and dot-notation access.
@@ -39,7 +36,7 @@ class Paper(NamedTuple):
     pdf_link: str        # Direct link to the PDF
     doi: Optional[str]   # DOI, if available
     journal_ref: Optional[str] # Journal reference, if available (e.g., "Phys. Rev. Lett. ...")
-    announce_type: Optional[str] # Type of announcement from RSS (e.g., 'new', 'replace'), or 'api_new' for API results
+    announce_type: Optional[str] # Where the record came from, e.g. 'api_new' or 'crossref_doi'
 
 
 class FetchPapersByIdResult(NamedTuple):
@@ -56,6 +53,8 @@ class PublicationRefreshResult(NamedTuple):
     checked_ids: List[str]
     failed_ids: List[str]
     degraded: bool
+    # Papers that got a Crossref lookup this run (their schedule restarts).
+    crossref_checked_ids: List[str] = []
 
 
 class TrackedPaperMetadata(NamedTuple):
@@ -69,6 +68,10 @@ class TrackedPaperMetadata(NamedTuple):
 ARXIV_ID_PATTERN = re.compile(r'(\d{4}\.\d{4,5})(v\d+)?')
 TITLE_NORMALIZATION_PATTERN = re.compile(r'[^a-z0-9]+')
 CROSSREF_API_URL = "https://api.crossref.org/works"
+# Crossref asks clients to stay well below its rate limit; one request per
+# second keeps the bot comfortably polite.
+CROSSREF_MIN_INTERVAL_SECONDS = 1.0
+CROSSREF_MAX_RETRY_AFTER_SECONDS = 60
 HTTP_STATUS_PATTERN = re.compile(r'HTTP (\d{3})')
 TRANSIENT_ARXIV_STATUS_CODES = {429, 500, 502, 503, 504}
 TRACKED_PAPER_REFRESH_CHUNK_SIZE = 10
@@ -92,7 +95,7 @@ def canonicalize_paper_id(raw_id: str) -> str:
 
 class ArxivFetcher:
     """
-    Fetches and normalizes paper information from arXiv using either the API or RSS feed.
+    Fetches and normalizes paper information from arXiv and Crossref.
     """
     def __init__(self, settings: AppSettings):
         """
@@ -106,60 +109,41 @@ class ArxivFetcher:
         # page_size, delay_seconds, num_retries help manage API rate limits and transient errors.
         self.arxiv_client = arxiv.Client(page_size=100, delay_seconds=3, num_retries=3)
         self.logger = logging.getLogger(self.__class__.__name__) # Get a logger specific to this class
-        # True only after an RSS fetch that returned a non-empty feed. The bot
-        # uses this to avoid consuming the daily RSS slot on a failed or empty
-        # fetch (e.g. when arXiv's announcement is late).
-        self.last_rss_fetch_complete = False
+        # Crossref calls run in executor threads, so pacing needs a lock.
+        self._crossref_lock = threading.Lock()
+        self._last_crossref_request = 0.0
 
-    async def fetch_latest_papers(self, last_submission_date_api: datetime) -> List[Paper]:
+    async def fetch_latest_papers(self) -> List[Paper]:
         """
-        Fetches papers from the configured source (API or RSS) based on settings.
+        Fetches target-author papers submitted within the lookback window.
 
-        This is the main entry point for fetching data. It routes the request
-        to the appropriate private method (_fetch_from_api or _fetch_from_rss).
-
-        Args:
-            last_submission_date_api: The timestamp used for filtering API results.
-                                      Only papers submitted after this time are fetched via API.
-                                      This argument is ignored if the source is RSS.
-
-        Returns:
-            A list of Paper objects matching the criteria. Returns an empty list on error.
-
-        Raises:
-            ValueError: If an invalid source is configured in settings.
+        The window deliberately overlaps previous runs: already-posted papers
+        are filtered out by the registry, so a late or skipped arXiv mailing,
+        or a few days with the bot offline, never cause a paper to be missed.
         """
-        loop = asyncio.get_event_loop()
-        papers: List[Paper] = []
-
-        # Route fetching based on the configured source
-        if self.settings.source == API_SOURCE:
-            self.logger.info("Fetching papers using the arXiv API.")
-            # API fetch requires the last submission date for filtering
-            papers = await self._fetch_from_api(last_submission_date_api)
-
-        elif self.settings.source == RSS_SOURCE:
-            self.logger.info("Fetching papers using the arXiv RSS feed.")
-            # feedparser is blocking, so run it in an executor thread to avoid blocking the event loop
-            papers = await loop.run_in_executor(None, self._fetch_from_rss)
-            if not self.last_rss_fetch_complete:
-                papers = await self._fetch_rss_fallback_from_api()
-
-        else:
-            # This should ideally be caught by settings validation, but serves as a safeguard.
-            self.logger.error(f"Invalid source configured: {self.settings.source}")
-            raise ValueError(f"Invalid source: {self.settings.source}")
-
-        self.logger.info(f"Found {len(papers)} papers matching criteria using source '{self.settings.source}'.")
+        since = datetime.now(timezone.utc) - timedelta(days=self.settings.lookback_days)
+        self.logger.info(
+            f"Fetching target-author papers submitted since {since:%Y-%m-%d %H:%M} UTC "
+            f"({self.settings.lookback_days}-day window)."
+        )
+        api_papers = await self._fetch_from_api(since)
+        # The API's au: search is looser than our matcher, so keep only papers
+        # where a tracked author really appears.
+        papers = [paper for paper in api_papers if self._is_author_match(paper.authors)]
+        self.logger.info(f"Found {len(papers)} papers by tracked authors.")
         return papers
 
     async def fetch_publication_updates(
         self,
         tracked_paper_ids: List[str],
         tracked_metadata: Optional[Dict[str, TrackedPaperMetadata]] = None,
+        crossref_due_ids: Optional[Set[str]] = None,
     ) -> PublicationRefreshResult:
         """
         Refreshes tracked arXiv papers and returns the ones that now look published.
+
+        `crossref_due_ids` limits the per-paper Crossref title searches to the
+        papers whose lookup is due (see publication_schedule.py); None means all.
 
         arXiv metadata is treated as the primary source of truth because a DOI or
         journal reference appearing there is the clearest signal that the authors
@@ -176,6 +160,10 @@ class ArxivFetcher:
         crossref_stats = {"requests": 0}
         crossref_fallback_attempts = 0
         crossref_fallback_skips = 0
+        crossref_checked_ids: List[str] = []
+
+        def crossref_due(paper_id: str) -> bool:
+            return crossref_due_ids is None or paper_id in crossref_due_ids
 
         if tracked_paper_fetch.failed_ids:
             refreshed_count = len(tracked_paper_fetch.requested_ids) - len(tracked_paper_fetch.failed_ids)
@@ -197,7 +185,10 @@ class ArxivFetcher:
 
             # Crossref is only consulted for papers that still look unpublished
             # on arXiv, which helps keep false positives low.
+            if not crossref_due(paper.id):
+                continue
             crossref_stats["requests"] += 1
+            crossref_checked_ids.append(paper.id)
             crossref_match = await loop.run_in_executor(None, self._find_crossref_publication, paper)
             if crossref_match:
                 publication_updates.append(crossref_match)
@@ -207,8 +198,11 @@ class ArxivFetcher:
             if stored_metadata is None:
                 crossref_fallback_skips += 1
                 continue
+            if not crossref_due(failed_id):
+                continue
 
             crossref_fallback_attempts += 1
+            crossref_checked_ids.append(failed_id)
             crossref_match = await self._crossref_fallback_for_failed_refresh(
                 failed_id,
                 stored_metadata,
@@ -240,6 +234,7 @@ class ArxivFetcher:
             checked_ids=checked_ids,
             failed_ids=tracked_paper_fetch.failed_ids,
             degraded=tracked_paper_fetch.degraded,
+            crossref_checked_ids=crossref_checked_ids,
         )
 
     async def fetch_papers_by_ids(self, paper_ids: List[str]) -> FetchPapersByIdResult:
@@ -646,99 +641,6 @@ class ArxivFetcher:
             deduped.append(value)
         return deduped
 
-    def _fetch_from_rss(self) -> List[Paper]:
-        """
-        Fetches papers from the arXiv RSS feed for a given category.
-        Note: RSS feed filtering happens *after* fetching, based on authors.
-              RSS does not support server-side date filtering like the API.
-
-        Returns:
-            A list of normalized Paper objects matching the target authors. Returns empty list on error.
-        """
-        feed_url = f"http://rss.arxiv.org/rss/{self.settings.category}"
-        self.logger.info(f"Fetching RSS feed: {feed_url}")
-        self.last_rss_fetch_complete = False
-
-        try:
-            # Parse the feed. feedparser handles redirects (like 301) automatically.
-            feed = feedparser.parse(feed_url)
-
-            # Check for parsing errors indicated by feedparser (non-fatal usually)
-            if feed.bozo:
-                 # Log bozo errors but don't necessarily stop unless feed.entries is missing
-                 self.logger.warning(f"Feedparser signaled potential issues parsing RSS feed (bozo): {getattr(feed, 'bozo_exception', 'Unknown reason')}")
-
-            # Check the *final* HTTP status code *after* redirects.
-            # Fail only on client (4xx) or server (5xx) errors. Allow 2xx (Success) and 3xx (Redirects).
-            status = getattr(feed, 'status', None)
-            if isinstance(status, list) and status:
-                status = status[0]
-            if isinstance(status, int) and status >= 400:
-                 self.logger.error(f"Failed to fetch RSS feed content, final HTTP status code: {status}")
-                 # Optionally log feed headers or content for debugging
-                 # self.logger.debug(f"Feed Headers: {getattr(feed, 'headers', {})}")
-                 return [] # Cannot proceed if the final fetch resulted in an error
-
-            # Additional check: Ensure entries exist, even if status is okay/redirect
-            if not hasattr(feed, 'entries') or not isinstance(feed.entries, list):
-                 self.logger.error(f"RSS feed fetched (status: {getattr(feed, 'status', 'N/A')}) but no 'entries' list found or it's not a list. Feed structure might be invalid.")
-                 return []
-
-            self.logger.info(f"RSS feed fetched successfully (final status: {getattr(feed, 'status', 'N/A')}), found {len(feed.entries)} entries.")
-            if not feed.entries:
-                 self.logger.warning(
-                     f"RSS feed is empty (feed pubDate: {feed.feed.get('published', 'N/A')}). "
-                     "Today's announcement is probably not out yet; a later run should retry."
-                 )
-                 return []
-            self.last_rss_fetch_complete = True
-
-        except Exception as e:
-            # Catch any other exceptions during feed fetching/parsing
-            self.logger.error(f"Exception occurred during RSS feed fetching/parsing for {feed_url}: {e}", exc_info=True)
-            return [] # Return empty list on error
-
-        papers: List[Paper] = []
-        for entry in feed.entries:
-            try:
-                # Attempt to normalize the raw RSS entry into our Paper structure
-                paper = self._normalize_rss_entry(entry)
-
-                # RSS filtering happens client-side because the feed itself only
-                # filters by category, not by author.
-                if paper and self._is_author_match(paper.authors):
-                    papers.append(paper) # Add the paper if it's valid and matches an author
-
-            except Exception as e:
-                 # Log errors during normalization of a specific entry but continue with others
-                 entry_id_str = getattr(entry, 'id', 'N/A') # Try to get ID for logging
-                 self.logger.warning(f"Skipping RSS entry ID '{entry_id_str}' due to error during normalization: {e}", exc_info=True)
-                 continue # Move to the next entry
-
-        return papers
-
-    async def _fetch_rss_fallback_from_api(self) -> List[Paper]:
-        """
-        Queries the API for recent target-author papers when the RSS feed is empty
-        or unreachable (e.g. a late or skipped arXiv mailing).
-
-        The lookback window spans a weekend plus a skipped mailing; papers that
-        were already posted are filtered out downstream by the paper registry.
-        """
-        since = datetime.now(timezone.utc) - timedelta(days=RSS_FALLBACK_LOOKBACK_DAYS)
-        self.logger.info(
-            f"RSS feed unavailable; falling back to arXiv API for target-author papers "
-            f"submitted since {since:%Y-%m-%d %H:%M} UTC."
-        )
-        try:
-            api_papers = await self._fetch_from_api(since)
-        except Exception as e:
-            self.logger.exception(f"API fallback for empty RSS feed failed: {e}")
-            return []
-        # The API's au: search is looser than our matcher, so apply the same
-        # author check the RSS path uses.
-        return [paper for paper in api_papers if self._is_author_match(paper.authors)]
-
     def _is_author_match(self, paper_authors: List[str]) -> bool:
         """
         Checks if any author in the paper's author list matches any of the target authors
@@ -789,145 +691,6 @@ class ArxivFetcher:
             announce_type='api_new' # Mark source as API; API doesn't distinguish announce types
         )
 
-    def _normalize_rss_entry(self, entry: feedparser.FeedParserDict) -> Optional[Paper]:
-        """
-        Converts a single entry dictionary from a feedparser result into a standardized Paper NamedTuple.
-        Includes robust checks for missing or malformed fields commonly found in feeds.
-
-        Args:
-            entry: A dictionary-like object representing an RSS entry.
-
-        Returns:
-            A Paper object if normalization is successful, otherwise None.
-        """
-        # --- Robust Validation and Access for Required Fields ---
-        # Use getattr for safe access, checking type with isinstance. Log and return None if invalid.
-        entry_id_url = getattr(entry, 'id', None)
-        if not isinstance(entry_id_url, str):
-            self.logger.warning(f"Skipping RSS entry: 'id' field missing or not a string. Entry data: {entry}")
-            return None
-
-        title = getattr(entry, 'title', None)
-        if not isinstance(title, str):
-            self.logger.warning(f"Skipping RSS entry ID '{entry_id_url}': 'title' field missing or not a string.")
-            return None
-
-        summary_raw = getattr(entry, 'summary', None)
-        if not isinstance(summary_raw, str):
-             self.logger.warning(f"Skipping RSS entry ID '{entry_id_url}': 'summary' field missing or not a string.")
-             return None
-
-        link = getattr(entry, 'link', None)
-        if not isinstance(link, str):
-             # Use entry_id_url as fallback if link is missing/invalid
-             self.logger.debug(f"Using 'id' as fallback 'link' for RSS entry ID '{entry_id_url}'.")
-             link = entry_id_url
-
-        # --- Author Parsing (Handles common RSS format) ---
-        authors: List[str] = []
-        raw_authors_list = getattr(entry, 'authors', []) # Get the 'authors' attribute, default to empty list
-        # Check if it's a list and has at least one element
-        if isinstance(raw_authors_list, list) and raw_authors_list:
-             # ArXiv RSS often puts all authors in a single string within the first dict: [{'name': 'Author A, Author B'}]
-             author_dict = raw_authors_list[0]
-             if isinstance(author_dict, dict):
-                 # Safely get the 'name' key which should contain the comma-separated string
-                 author_string = author_dict.get('name')
-                 if isinstance(author_string, str):
-                     # Split the string by comma, decode LaTeX, strip whitespace, and filter out empty strings
-                     authors = [decode_author_name(name.strip()) for name in author_string.split(',') if name.strip()]
-
-        # Log a warning if authors could not be parsed, but proceed (filtering might miss it later)
-        if not authors:
-            self.logger.warning(f"Could not parse authors for RSS entry ID: {entry_id_url}. Raw 'authors' field: {raw_authors_list}")
-            # Depending on requirements, could `return None` here if authors are strictly needed.
-
-        # --- ID and PDF Link Extraction ---
-        try:
-            # Extract the numerical ID part from the abstract URL (which is entry_id_url)
-            paper_id_part = entry_id_url.split('/abs/')[-1]
-            pdf_link = f"http://arxiv.org/pdf/{paper_id_part}"
-        except Exception as e:
-             self.logger.error(f"Failed to extract paper ID part from URL '{entry_id_url}' for entry: {e}", exc_info=True)
-             return None # Cannot proceed without the ID part
-
-        # --- Date Parsing (Handles feedparser's `published_parsed` and fallback) ---
-        published_dt: Optional[datetime] = None
-        try:
-            # feedparser pre-parses dates into `published_parsed` (a time.struct_time)
-            published_parsed_value = getattr(entry, 'published_parsed', None)
-            if published_parsed_value:
-                try:
-                    # Cast to time.struct_time for type checker sanity.
-                    # time.struct_time is like a tuple of 9 integers (year, mon, day, hour, min, sec, wday, yday, isdst)
-                    parsed_tuple = cast(time.struct_time, published_parsed_value)
-                    # Runtime check for safety: ensure it has at least 6 elements (Y, M, D, H, M, S)
-                    if len(parsed_tuple) >= 6:
-                         # Create datetime object using the first 6 elements. Assume UTC.
-                         published_dt = datetime(*parsed_tuple[:6], tzinfo=ZoneInfo('UTC'))
-                         self.logger.debug(f"Successfully parsed date from 'published_parsed' for {entry_id_url}")
-                    else:
-                         # Log if the tuple is malformed
-                         self.logger.warning(f"Attribute 'published_parsed' for entry {entry_id_url} has too few elements: {parsed_tuple}. Attempting string fallback.")
-                         published_parsed_value = None # Prevent reuse, force fallback
-                except (TypeError, ValueError) as cast_err:
-                     # Log if casting/using the tuple fails unexpectedly
-                     self.logger.warning(f"Could not use 'published_parsed' for entry {entry_id_url} despite existing. Error: {cast_err}. Raw value: {published_parsed_value}. Attempting string fallback.")
-                     published_parsed_value = None # Prevent reuse, force fallback
-
-            # Fallback: If 'published_parsed' wasn't usable or present, try parsing the 'published' string
-            if published_dt is None:
-                 published_str = getattr(entry, 'published', None)
-                 if isinstance(published_str, str):
-                    self.logger.debug(f"Parsing published date string '{published_str}' for {entry_id_url}")
-                    try:
-                        # Common RSS/Atom date format with timezone offset (%z)
-                        published_dt = datetime.strptime(published_str, '%a, %d %b %Y %H:%M:%S %z')
-                    except ValueError as strp_err:
-                         # Log error if string parsing fails with the expected format
-                         self.logger.error(f"Error parsing published date string for RSS entry {entry_id_url} (value: '{published_str}', format: '%a, %d %b %Y %H:%M:%S %z'): {strp_err}")
-                         return None # Cannot proceed without a valid date
-                 else:
-                    # Log if no date information is found at all
-                    self.logger.warning(f"Could not find usable published date (neither parsed nor string) for RSS entry {entry_id_url}.")
-                    return None # Cannot proceed without a date
-
-        except Exception as e:
-            # Catch any other unexpected errors during the date processing block
-            pub_str = getattr(entry, 'published', 'N/A')
-            pub_parsed = getattr(entry, 'published_parsed', 'N/A')
-            self.logger.exception(f"Unexpected error during date processing for RSS entry {entry_id_url} (str='{pub_str}', parsed='{pub_parsed}'): {e}")
-            return None
-
-        # --- Summary Cleanup ---
-        # Remove the "Abstract: " prefix often found in arXiv RSS summaries
-        summary = summary_raw.split("Abstract: ", 1)[-1].strip().replace('\n', ' ')
-
-        # --- Get Optional Fields Safely ---
-        journal_ref = getattr(entry, 'arxiv_journal_reference', None) # Standard key in arXiv RSS for journal ref
-        doi = getattr(entry, 'arxiv_doi', None) # Standard key in arXiv RSS for DOI, when available
-        announce_type = getattr(entry, 'arxiv_announce_type', 'rss_unknown') # Key for 'new', 'replace', etc.
-
-        # Ensure optional fields are strings or None (handle potential non-string types gracefully)
-        if journal_ref is not None and not isinstance(journal_ref, str): journal_ref = str(journal_ref)
-        if doi is not None and not isinstance(doi, str): doi = str(doi)
-        if announce_type is not None and not isinstance(announce_type, str): announce_type = str(announce_type)
-
-        # --- Final Assembly into Paper Object ---
-        # All required fields have been validated or have fallbacks by this point.
-        return Paper(
-            id=canonicalize_paper_id(entry_id_url),
-            title=title.strip(),    # Validated string, clean whitespace
-            authors=authors,        # List[str] (might be empty if parsing failed)
-            published=published_dt, # Validated timezone-aware datetime
-            summary=summary,        # Cleaned string
-            link=link,              # Validated string
-            pdf_link=pdf_link,      # Constructed string
-            doi=self._clean_optional_text(doi),                # Optional[str]
-            journal_ref=self._clean_optional_text(journal_ref), # Optional[str]
-            announce_type=announce_type # Optional[str]
-        )
-
     def _find_crossref_publication(self, paper: Paper) -> Optional[Paper]:
         """Queries Crossref for a likely journal-article match when arXiv metadata is incomplete."""
         if not paper.title or not paper.authors:
@@ -951,8 +714,7 @@ class ArxivFetcher:
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                payload = json.load(response)
+            payload = self._crossref_get_json(request)
         except Exception as e:
             self.logger.warning(f"Crossref lookup failed for {paper.id}: {e}")
             return None
@@ -979,14 +741,43 @@ class ArxivFetcher:
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                payload = json.load(response)
+            payload = self._crossref_get_json(request)
         except Exception as e:
             self.logger.warning(f"Crossref DOI lookup failed for {doi}: {e}")
             return None
 
         item = payload.get("message")
         return item if isinstance(item, dict) else None
+
+    def _crossref_get_json(self, request: urllib.request.Request) -> Any:
+        """
+        Performs one Crossref request, paced to at most one per second.
+
+        On HTTP 429 it waits as long as Crossref asks (capped) and retries once;
+        any other failure is raised to the caller.
+        """
+        for attempt in range(2):
+            with self._crossref_lock:
+                wait = self._last_crossref_request + CROSSREF_MIN_INTERVAL_SECONDS - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                self._last_crossref_request = time.monotonic()
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as e:
+                if e.code != 429 or attempt == 1:
+                    raise
+                retry_after = self._retry_after_seconds(e)
+                self.logger.info(f"Crossref rate limit hit; waiting {retry_after:.0f}s before retrying.")
+                time.sleep(retry_after)
+
+    def _retry_after_seconds(self, error: urllib.error.HTTPError) -> float:
+        try:
+            seconds = float(error.headers.get("Retry-After", 5))
+        except (TypeError, ValueError):
+            seconds = 5.0
+        return min(max(seconds, 1.0), CROSSREF_MAX_RETRY_AFTER_SECONDS)
 
     def _crossref_item_to_publication_update(self, paper: Paper, item: Dict[str, Any]) -> Optional[Paper]:
         """Validates a Crossref record and converts it into a publication update."""
