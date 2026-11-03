@@ -30,8 +30,8 @@ from datetime import datetime
 def main():
     # List of authors to search for
     authors = [
-        "Mauro Paternostro",
-        "Francesco Ciccarello"
+        "Alice Example",
+        "Bob Example"
     ]
 
     # Define the earliest date we want in YYYYMMDD format

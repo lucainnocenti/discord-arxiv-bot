@@ -145,16 +145,16 @@ class PublicationTrackingTests(unittest.TestCase):
                 channel_id=1,
                 test_channel_id=2,
                 target_authors=[
-                    "Marcel Augusto Pinto",
-                    "M. Augusto Pinto",
-                    "M Augusto Pinto",
+                    "Carla Bianca Rossi",
+                    "C. Bianca Rossi",
+                    "C Bianca Rossi",
                 ],
-                author_discord_ids={"Marcel Augusto Pinto": 54321},
+                author_discord_ids={"Carla Bianca Rossi": 54321},
                 script_dir=tmpdir,
             )
             fetcher = ArxivFetcher(settings)
 
-            self.assertTrue(fetcher._is_author_match(["Marcel A. Pinto", "Coauthor Example"]))
+            self.assertTrue(fetcher._is_author_match(["Carla B. Rossi", "Coauthor Example"]))
 
     def test_is_author_match_rejects_different_full_name_matching_initial_alias(self):
         with workspace_tempdir() as tmpdir:
@@ -163,17 +163,17 @@ class PublicationTrackingTests(unittest.TestCase):
                 channel_id=1,
                 test_channel_id=2,
                 target_authors=[
-                    "Subhojit Pal",
-                    "S. Pal",
-                    "S Pal",
+                    "Sebastian Kor",
+                    "S. Kor",
+                    "S Kor",
                 ],
                 author_discord_ids={},
                 script_dir=tmpdir,
             )
             fetcher = ArxivFetcher(settings)
 
-            self.assertFalse(fetcher._is_author_match(["Subhajit Pal", "Coauthor Example"]))
-            self.assertTrue(fetcher._is_author_match(["S. Pal", "Coauthor Example"]))
+            self.assertFalse(fetcher._is_author_match(["Sebastien Kor", "Coauthor Example"]))
+            self.assertTrue(fetcher._is_author_match(["S. Kor", "Coauthor Example"]))
 
     def test_format_message_mentions_canonical_author_for_initial_variant(self):
         with workspace_tempdir() as tmpdir:
@@ -182,18 +182,18 @@ class PublicationTrackingTests(unittest.TestCase):
                 channel_id=1,
                 test_channel_id=2,
                 target_authors=[
-                    "Marcel Augusto Pinto",
-                    "M. Augusto Pinto",
-                    "M Augusto Pinto",
+                    "Carla Bianca Rossi",
+                    "C. Bianca Rossi",
+                    "C Bianca Rossi",
                 ],
                 author_discord_ids={
-                    "Marcel Augusto Pinto": 54321,
-                    "M. Augusto Pinto": 54321,
-                    "M Augusto Pinto": 54321,
+                    "Carla Bianca Rossi": 54321,
+                    "C. Bianca Rossi": 54321,
+                    "C Bianca Rossi": 54321,
                 },
                 script_dir=tmpdir,
             )
-            paper = make_paper(authors=["Marcel A. Pinto", "Bob Example"])
+            paper = make_paper(authors=["Carla B. Rossi", "Bob Example"])
 
             message = format_paper_message(paper, settings)
 

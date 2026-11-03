@@ -1,5 +1,7 @@
 """Weekly sync of current group members from the group website.
 
+The page URL comes from MEMBERS_PAGE_URL in config.py; without it the sync is off.
+
 New current members that no tracked author matches are appended to the
 tracked-author file with source "website". The sync only ever adds: people who
 leave the group stay tracked, and names in `ignored_website_names` are skipped.
@@ -23,7 +25,6 @@ from tracked_authors import (
 )
 from utils import find_matching_target_authors
 
-PEOPLE_PAGE_URL = "https://quantum.unipa.it/people/"
 MEMBER_SYNC_INTERVAL = timedelta(days=7)
 # Former members are listed as plain names, not cards, but skip the section
 # explicitly in case the markup changes.
@@ -99,8 +100,8 @@ def parse_people_page(html: str) -> List[WebsiteMember]:
     return parser.members
 
 
-def fetch_website_members(url: str = PEOPLE_PAGE_URL) -> List[WebsiteMember]:
-    request = urllib.request.Request(url, headers={"User-Agent": "qunipa-arxiv-bot"})
+def fetch_website_members(url: str) -> List[WebsiteMember]:
+    request = urllib.request.Request(url, headers={"User-Agent": "arxiv-discord-bot"})
     with urllib.request.urlopen(request, timeout=30) as response:
         html = response.read().decode("utf-8", errors="replace")
     return parse_people_page(html)
@@ -137,12 +138,15 @@ def sync_members_from_website(settings: AppSettings) -> List[str]:
     if not settings.member_sync_enabled:
         logger.info("Website member sync disabled (--nomembersync).")
         return []
+    if not settings.members_page_url:
+        logger.info("Website member sync off: MEMBERS_PAGE_URL not set in config.py.")
+        return []
     if not is_member_sync_due(settings):
         logger.info("Website member sync not due yet (runs weekly).")
         return []
 
     try:
-        members = fetch_website_members()
+        members = fetch_website_members(settings.members_page_url)
     except Exception as e:
         logger.warning(f"Website member sync failed; will retry next run: {e}")
         return []
@@ -168,7 +172,7 @@ def sync_members_from_website(settings: AppSettings) -> List[str]:
 
 
 def _notify_new_authors(settings: AppSettings, added: List[WebsiteMember]):
-    lines = [f"arxiv-bot: added {len(added)} new tracked author(s) from {PEOPLE_PAGE_URL}"]
+    lines = [f"arxiv-bot: added {len(added)} new tracked author(s) from {settings.members_page_url}"]
     lines += [f"- {member.name} ({member.group or 'unknown role'})" for member in added]
     lines.append("Check their arXiv name forms in tracked_authors.json.")
     send_telegram_message(settings, "\n".join(lines))

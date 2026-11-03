@@ -47,6 +47,7 @@ class AppSettings:
     force_rss_check: bool = False
     use_test_channel: bool = False
     member_sync_enabled: bool = True
+    members_page_url: Optional[str] = None
     force_member_sync: bool = False
 
     # Maintainer notifications (optional)
@@ -128,6 +129,7 @@ def load_settings() -> AppSettings:
         force_rss_check=args.forcerss,
         use_test_channel=args.testchannel,
         member_sync_enabled=not args.nomembersync,
+        members_page_url=getattr(config, "MEMBERS_PAGE_URL", None),
         force_member_sync=args.forcemembersync,
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", getattr(config, "TELEGRAM_BOT_TOKEN", None)),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", getattr(config, "TELEGRAM_CHAT_ID", None)),

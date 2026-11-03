@@ -30,7 +30,7 @@ def person_card(name, slug):
     )
 
 
-def people_page(current, alumni=("Paolo Erdman",)):
+def people_page(current, alumni=("Former Member",)):
     cards = "".join(person_card(name, name.lower().replace(" ", "-")) for name in current)
     alumni_html = "".join(f"<li>{name}</li>" for name in alumni)
     return (
@@ -45,9 +45,9 @@ FILLER = [f"Filler Person{i}" for i in range(10)]
 
 class PeoplePageParsingTests(unittest.TestCase):
     def test_parses_current_member_cards_and_skips_alumni(self):
-        members = parse_people_page(people_page(["Markos Arapchatzis", *FILLER]))
-        self.assertIn(WebsiteMember("Markos Arapchatzis", "phd", "markos-arapchatzis"), members)
-        self.assertNotIn("Paolo Erdman", [m.name for m in members])
+        members = parse_people_page(people_page(["Nora Lindqvist", *FILLER]))
+        self.assertIn(WebsiteMember("Nora Lindqvist", "phd", "nora-lindqvist"), members)
+        self.assertNotIn("Former Member", [m.name for m in members])
 
     def test_rejects_page_with_too_few_members(self):
         with self.assertRaises(ValueError):
@@ -57,12 +57,12 @@ class PeoplePageParsingTests(unittest.TestCase):
 class UntrackedMemberTests(unittest.TestCase):
     def test_known_variants_and_ignored_names_are_not_new(self):
         tracked = TrackedAuthorList(
-            authors=[TrackedAuthor("Massimo Palma", variations=["G. Massimo Palma"])],
-            ignored_website_names=["Kam Chon Fai"],
+            authors=[TrackedAuthor("Enzo Ferri", variations=["R. Enzo Ferri"])],
+            ignored_website_names=["Ignored Person"],
         )
         members = [
-            WebsiteMember("G. Massimo Palma", "faculty", None),
-            WebsiteMember("Kam Chon Fai", "postdoc", None),
+            WebsiteMember("R. Enzo Ferri", "faculty", None),
+            WebsiteMember("Ignored Person", "postdoc", None),
             WebsiteMember("New Person", "phd", None),
         ]
         self.assertEqual([m.name for m in find_untracked_members(members, tracked)], ["New Person"])
@@ -89,14 +89,14 @@ class TrackedAuthorFileTests(unittest.TestCase):
 
     def test_bootstraps_from_legacy_config(self):
         legacy = SimpleNamespace(names_variations={
-            "Diana Chisholm": ["D. Chisholm", "D Chisholm", "Diana A. Chisholm"],
+            "Dana Holt": ["D. Holt", "D Holt", "Dana A. Holt"],
         })
         loaded = load_tracked_authors(self.path, legacy_config=legacy)
         self.assertTrue(os.path.exists(self.path))
-        self.assertEqual(loaded.authors[0].variations, ["Diana A. Chisholm"])
+        self.assertEqual(loaded.authors[0].variations, ["Dana A. Holt"])
         self.assertEqual(
             expand_target_names(loaded),
-            ["Diana Chisholm", "D. Chisholm", "D Chisholm", "Diana A. Chisholm"],
+            ["Dana Holt", "D. Holt", "D Holt", "Dana A. Holt"],
         )
 
     def test_discord_ids_cover_name_variants(self):
@@ -112,6 +112,7 @@ class SyncFlowTests(unittest.TestCase):
         self.settings = AppSettings(
             discord_token="token", channel_id=1, test_channel_id=2,
             target_authors=[], author_discord_ids={}, script_dir=self.tmpdir,
+            members_page_url="https://example.org/people/",
         )
         save_tracked_authors(
             self.settings.tracked_authors_file,
