@@ -3,7 +3,7 @@
 import logging
 from typing import Dict, List, Optional
 
-from arxiv_fetcher import Paper
+from models import Paper
 from settings import AppSettings
 from utils import find_matching_target_authors
 

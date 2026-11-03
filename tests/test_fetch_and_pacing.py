@@ -8,8 +8,9 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-import arxiv_fetcher
-from arxiv_fetcher import ArxivFetcher
+import crossref
+from arxiv_source import ArxivSource
+from crossref import CrossrefClient
 from run_lock import LockHeldElsewhere, run_lock
 from tests.test_publication_tracking import make_paper, make_settings, workspace_tempdir
 
@@ -19,7 +20,7 @@ class RollingWindowFetchTests(unittest.TestCase):
         with workspace_tempdir() as tmpdir:
             settings = make_settings(tmpdir)
             settings.lookback_days = 7
-            fetcher = ArxivFetcher(settings)
+            source = ArxivSource(settings)
             tracked = make_paper(id="2611.00001")
             namesake = make_paper(id="2611.00002", authors=["Alicia Exampleton"])
             seen_since = []
@@ -28,8 +29,8 @@ class RollingWindowFetchTests(unittest.TestCase):
                 seen_since.append(since)
                 return [tracked, namesake]
 
-            fetcher._fetch_from_api = fake_api  # type: ignore[method-assign]
-            papers = asyncio.run(fetcher.fetch_latest_papers())
+            source._search_since = fake_api  # type: ignore[method-assign]
+            papers = asyncio.run(source.search_recent())
 
             self.assertEqual([p.id for p in papers], ["2611.00001"])
             age = datetime.now(timezone.utc) - seen_since[0]
@@ -39,22 +40,22 @@ class RollingWindowFetchTests(unittest.TestCase):
 class CrossrefPacingTests(unittest.TestCase):
     def test_retries_once_after_rate_limit(self):
         with workspace_tempdir() as tmpdir:
-            fetcher = ArxivFetcher(make_settings(tmpdir))
+            client = CrossrefClient()
             rate_limited = urllib.error.HTTPError("url", 429, "Too Many Requests", {"Retry-After": "2"}, None)
             ok = io.BytesIO(b'{"message": {}}')
-            with patch.object(arxiv_fetcher.urllib.request, "urlopen", side_effect=[rate_limited, ok]), \
-                    patch.object(arxiv_fetcher.time, "sleep") as sleep:
-                payload = fetcher._crossref_get_json("request")
+            with patch.object(crossref.urllib.request, "urlopen", side_effect=[rate_limited, ok]), \
+                    patch.object(crossref.time, "sleep") as sleep:
+                payload = client._get_json("https://example.org")
             self.assertEqual(payload, {"message": {}})
             self.assertIn(2.0, [call.args[0] for call in sleep.call_args_list])
 
     def test_other_errors_are_raised(self):
         with workspace_tempdir() as tmpdir:
-            fetcher = ArxivFetcher(make_settings(tmpdir))
+            client = CrossrefClient()
             server_error = urllib.error.HTTPError("url", 500, "Server Error", {}, None)
-            with patch.object(arxiv_fetcher.urllib.request, "urlopen", side_effect=server_error):
+            with patch.object(crossref.urllib.request, "urlopen", side_effect=server_error):
                 with self.assertRaises(urllib.error.HTTPError):
-                    fetcher._crossref_get_json("request")
+                    client._get_json("https://example.org")
 
 
 class RunLockTests(unittest.TestCase):
