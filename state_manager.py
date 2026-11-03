@@ -4,8 +4,7 @@ import json
 import os
 import logging
 from dataclasses import asdict, dataclass, field
-from datetime import date
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from settings import AppSettings
 from arxiv_fetcher import canonicalize_paper_id
@@ -21,8 +20,6 @@ class PaperRecord:
     journal_ref: Optional[str] = None
     title: Optional[str] = None
     authors: List[str] = field(default_factory=list)
-    # ISO date of the last Crossref publication lookup (see publication_schedule.py).
-    crossref_checked: Optional[str] = None
 
 class StateManager:
     def __init__(self, settings: AppSettings):
@@ -59,7 +56,6 @@ class StateManager:
                         journal_ref=record.journal_ref or existing.journal_ref,
                         title=record.title or existing.title,
                         authors=record.authors or existing.authors,
-                        crossref_checked=max(filter(None, (record.crossref_checked, existing.crossref_checked)), default=None),
                     )
 
             logging.info(f"Loaded {len(registry)} tracked paper records from {file_path}")
@@ -115,7 +111,6 @@ class StateManager:
             journal_ref=journal_ref or current.journal_ref,
             title=title or current.title,
             authors=cleaned_authors or list(current.authors),
-            crossref_checked=current.crossref_checked,
         )
         registry[canonical_paper_id] = updated
 
@@ -129,19 +124,6 @@ class StateManager:
             f"posted={updated.posted}, published={updated.published}, doi={updated.doi}"
         )
         return updated
-
-    def mark_crossref_checked(self, paper_ids: Iterable[str], checked_on: date) -> Dict[str, PaperRecord]:
-        """Records a Crossref lookup date for several papers with a single file write."""
-        registry = self.get_paper_registry()
-        for paper_id in paper_ids:
-            canonical_paper_id = canonicalize_paper_id(paper_id)
-            if canonical_paper_id in registry:
-                registry[canonical_paper_id].crossref_checked = checked_on.isoformat()
-        if self.settings.no_save:
-            logging.info("Skipping save of Crossref check dates (--nosave).")
-        else:
-            self._write_paper_registry(registry)
-        return registry
 
     def _parse_registry_line(self, line: str) -> tuple[Optional[str], PaperRecord]:
         """Parses a registry line supporting both legacy IDs and JSON records."""
@@ -163,7 +145,6 @@ class StateManager:
                         for author in data.get("authors", [])
                         if isinstance(author, str)
                     ] if isinstance(data.get("authors"), list) else [],
-                    crossref_checked=data.get("crossref_checked") if isinstance(data.get("crossref_checked"), str) else None,
                 )
             except Exception as e:
                 logging.warning(f"Skipping unreadable tracked-paper record '{line}': {e}")

@@ -5,7 +5,6 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import date
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Set
 
@@ -15,7 +14,6 @@ from state_manager import PaperRecord, StateManager
 from arxiv_fetcher import ArxivFetcher, Paper, TrackedPaperMetadata
 from discord_formatter import format_paper_message
 from member_sync import sync_members_from_website
-from publication_schedule import is_crossref_check_due
 from run_lock import LockHeldElsewhere, run_lock
 
 LOG_MAX_BYTES = 1_000_000
@@ -223,16 +221,7 @@ class ArxivBotClient(discord.Client):
             self.logger.info("No tracked unpublished papers require publication checks.")
             return 0, False
 
-        today = date.today()
-        crossref_due_ids = {
-            paper_id
-            for paper_id, record in tracked_records.items()
-            if is_crossref_check_due(paper_id, record.crossref_checked, today)
-        }
-        self.logger.info(
-            f"Checking publication status for {len(tracked_ids)} tracked papers "
-            f"(Crossref lookup due for {len(crossref_due_ids)})."
-        )
+        self.logger.info(f"Checking publication status for {len(tracked_ids)} tracked papers.")
         try:
             refresh_result = await self.fetcher.fetch_publication_updates(
                 tracked_ids,
@@ -245,17 +234,10 @@ class ArxivBotClient(discord.Client):
                     )
                     for paper_id, record in tracked_records.items()
                 },
-                crossref_due_ids=crossref_due_ids,
             )
         except Exception as e:
             self.logger.exception(f"Failed to refresh publication metadata: {e}")
             return 0, True
-
-        if refresh_result.crossref_checked_ids:
-            # Restart each looked-up paper's schedule; one registry write for all.
-            self.paper_registry = self.state_manager.mark_crossref_checked(
-                refresh_result.crossref_checked_ids, today
-            )
 
         if refresh_result.degraded:
             self.logger.warning(

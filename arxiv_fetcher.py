@@ -17,7 +17,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo # For timezone handling (especially UTC and ET)
-from typing import List, Dict, Any, NamedTuple, Optional, Set, Tuple # For type hinting
+from typing import List, Dict, Any, NamedTuple, Optional, Tuple # For type hinting
 
 # Import settings and utilities from other modules in the project
 from settings import AppSettings
@@ -53,8 +53,6 @@ class PublicationRefreshResult(NamedTuple):
     checked_ids: List[str]
     failed_ids: List[str]
     degraded: bool
-    # Papers that got a Crossref lookup this run (their schedule restarts).
-    crossref_checked_ids: List[str] = []
 
 
 class TrackedPaperMetadata(NamedTuple):
@@ -137,13 +135,9 @@ class ArxivFetcher:
         self,
         tracked_paper_ids: List[str],
         tracked_metadata: Optional[Dict[str, TrackedPaperMetadata]] = None,
-        crossref_due_ids: Optional[Set[str]] = None,
     ) -> PublicationRefreshResult:
         """
         Refreshes tracked arXiv papers and returns the ones that now look published.
-
-        `crossref_due_ids` limits the per-paper Crossref title searches to the
-        papers whose lookup is due (see publication_schedule.py); None means all.
 
         arXiv metadata is treated as the primary source of truth because a DOI or
         journal reference appearing there is the clearest signal that the authors
@@ -160,10 +154,6 @@ class ArxivFetcher:
         crossref_stats = {"requests": 0}
         crossref_fallback_attempts = 0
         crossref_fallback_skips = 0
-        crossref_checked_ids: List[str] = []
-
-        def crossref_due(paper_id: str) -> bool:
-            return crossref_due_ids is None or paper_id in crossref_due_ids
 
         if tracked_paper_fetch.failed_ids:
             refreshed_count = len(tracked_paper_fetch.requested_ids) - len(tracked_paper_fetch.failed_ids)
@@ -185,10 +175,7 @@ class ArxivFetcher:
 
             # Crossref is only consulted for papers that still look unpublished
             # on arXiv, which helps keep false positives low.
-            if not crossref_due(paper.id):
-                continue
             crossref_stats["requests"] += 1
-            crossref_checked_ids.append(paper.id)
             crossref_match = await loop.run_in_executor(None, self._find_crossref_publication, paper)
             if crossref_match:
                 publication_updates.append(crossref_match)
@@ -198,11 +185,8 @@ class ArxivFetcher:
             if stored_metadata is None:
                 crossref_fallback_skips += 1
                 continue
-            if not crossref_due(failed_id):
-                continue
 
             crossref_fallback_attempts += 1
-            crossref_checked_ids.append(failed_id)
             crossref_match = await self._crossref_fallback_for_failed_refresh(
                 failed_id,
                 stored_metadata,
@@ -234,7 +218,6 @@ class ArxivFetcher:
             checked_ids=checked_ids,
             failed_ids=tracked_paper_fetch.failed_ids,
             degraded=tracked_paper_fetch.degraded,
-            crossref_checked_ids=crossref_checked_ids,
         )
 
     async def fetch_papers_by_ids(self, paper_ids: List[str]) -> FetchPapersByIdResult:
