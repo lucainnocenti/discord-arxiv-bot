@@ -64,6 +64,7 @@ class Pipeline:
             self.logger.exception(f"Failed to fetch papers: {e}")
             return
 
+        send_failures = 0
         for paper in papers:
             if paper.id in self.announced_new:
                 continue
@@ -79,12 +80,23 @@ class Pipeline:
             # includes DOI/journal data when arXiv or Crossref has it.
             paper = await self.publications.enrich(paper)
             self.logger.info(f"Processing paper: '{paper.title}' ({paper.id})")
-            if await self._announce(paper, "new"):
+            delivered = await self._announce(paper, "new")
+            if delivered:
                 summary.papers_posted += 1
                 self.registry.record_paper(paper, posted=True, published=bool(paper.journal_ref or paper.doi))
                 # Save right away: a crash later in the run must not lose the
                 # fact that this paper was announced, or it would be re-posted.
                 self.registry.save()
+            elif delivered is False:
+                send_failures += 1
+
+        # A paper that failed to send may drop out of tomorrow's feed, so the
+        # announcement is only recorded as processed when everything went out;
+        # otherwise the next run's API search picks the paper up again.
+        if send_failures:
+            self.logger.warning(f"{send_failures} message(s) failed to send; they will be retried next run.")
+        elif not self.settings.no_send:
+            self.arxiv.commit_coverage()
 
     async def _hydrate_missing_metadata(self, summary: RunSummary):
         """Backfills title/author metadata for legacy or sparse registry records."""
@@ -162,17 +174,21 @@ class Pipeline:
                 self.registry.record_paper(paper, published=True)
                 self.registry.save()
 
-    async def _announce(self, paper: Paper, event_type: str) -> bool:
-        """Formats and sends one message. Returns True only if it was delivered."""
+    async def _announce(self, paper: Paper, event_type: str) -> Optional[bool]:
+        """
+        Formats and sends one message. Returns True if it was delivered, False
+        if sending failed, and None if it was skipped (unformattable, or a
+        --nosend dry run).
+        """
         message = format_paper_message(paper, self.settings, event_type=event_type)
         if not message:
             self.logger.warning(f"Skipping {event_type} message for '{paper.title}': formatting failed (likely too long).")
-            return False
+            return None
 
         if self.settings.no_send:
             self.logger.info(f"[NO_SEND] Would post {event_type} message for paper: {paper.title}")
             self.logger.debug(f"Message content:\n{message}")
-            return False
+            return None
 
         self.logger.info(f"Sending {event_type} message for paper: {paper.title}")
         return await self.send(message)

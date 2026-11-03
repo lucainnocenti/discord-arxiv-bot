@@ -1,16 +1,16 @@
 """Reads the arXiv RSS feed for a category: the papers in the latest daily
-announcement. Used as a fallback when the API search fails.
+announcement, and that announcement's date.
 
-The feed only holds the latest mailing (and is empty until it is out), which
-is why the API's overlapping time window is the primary source.
+The feed only holds the latest mailing (and is empty until it is out), so the
+bot uses it for each day's papers and the API search for any days it missed.
 """
 
 import logging
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 from pylatexenc.latex2text import LatexNodes2Text
 
@@ -28,23 +28,32 @@ logger = logging.getLogger("RssSource")
 _latex = LatexNodes2Text()
 
 
-def fetch_rss_papers(category: str) -> List[Paper]:
+class RssFeed(NamedTuple):
+    # Announcement date in arXiv's (US Eastern) calendar. The feed carries it
+    # even while still empty, so only a feed with papers counts as covering it.
+    announced: Optional[date]
+    papers: List[Paper]
+
+
+def fetch_rss_feed(category: str) -> RssFeed:
     """Downloads and parses the feed; raises on network or HTTP errors."""
     url = RSS_URL.format(category=category)
     request = urllib.request.Request(url, headers={"User-Agent": "arxiv-discord-bot/1.0"})
     with urllib.request.urlopen(request, timeout=30) as response:
         xml_text = response.read()
-    papers = parse_feed(xml_text)
-    if not papers:
-        logger.warning(f"RSS feed {url} has no new papers; today's announcement may not be out yet.")
+    feed = parse_feed(xml_text)
+    if not feed.papers:
+        logger.warning(f"RSS feed {url} has no new papers; the {feed.announced} announcement may not be out yet.")
     else:
-        logger.info(f"RSS feed {url} lists {len(papers)} new papers.")
-    return papers
+        logger.info(f"RSS feed {url} lists {len(feed.papers)} new papers announced {feed.announced}.")
+    return feed
 
 
-def parse_feed(xml_text) -> List[Paper]:
-    """Parses an arXiv RSS document into Papers, keeping only new announcements."""
+def parse_feed(xml_text) -> RssFeed:
+    """Parses an arXiv RSS document, keeping only new announcements."""
     root = ET.fromstring(xml_text)
+    pub_date = root.findtext("channel/pubDate")
+    announced = parsedate_to_datetime(pub_date).date() if pub_date else None
     papers = []
     for item in root.iter("item"):
         try:
@@ -54,7 +63,32 @@ def parse_feed(xml_text) -> List[Paper]:
             continue
         if paper:
             papers.append(paper)
-    return papers
+    return RssFeed(announced, papers)
+
+
+def previous_announcement_day(day: date) -> date:
+    """The weekday before `day`: arXiv announces Monday to Friday."""
+    previous = day - timedelta(days=1)
+    while previous.weekday() >= 5:
+        previous -= timedelta(days=1)
+    return previous
+
+
+def read_last_covered(path: str) -> Optional[date]:
+    """The latest announcement day whose papers (and all before it) were processed."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return date.fromisoformat(f.read().strip())
+    except FileNotFoundError:
+        return None
+    except ValueError as e:
+        logger.warning(f"Ignoring unreadable {path}: {e}")
+        return None
+
+
+def write_last_covered(path: str, day: date):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(day.isoformat())
 
 
 def _paper_from_item(item: ET.Element) -> Optional[Paper]:

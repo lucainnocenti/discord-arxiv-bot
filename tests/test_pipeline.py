@@ -63,6 +63,21 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(summary.papers_posted, 0)
             self.assertFalse(pipeline.registry.get("2611.00001").posted)
+            # The announcement stays unprocessed, so the next run's API search retries it.
+            pipeline.arxiv.commit_coverage.assert_not_called()
+
+    def test_announcement_is_recorded_once_everything_was_sent(self):
+        with workspace_tempdir() as tmpdir:
+            pipeline, _ = make_pipeline(tmpdir, new_papers=[make_paper(id="2611.00001")])
+            asyncio.run(pipeline.run())
+            pipeline.arxiv.commit_coverage.assert_called_once()
+
+    def test_unformattable_paper_does_not_block_recording(self):
+        with workspace_tempdir() as tmpdir:
+            pipeline, sender = make_pipeline(tmpdir, new_papers=[make_paper(id="2611.00001", title="x" * 2100)])
+            asyncio.run(pipeline.run())
+            self.assertEqual(sender.messages, [])
+            pipeline.arxiv.commit_coverage.assert_called_once()
 
     def test_no_send_dry_run_sends_and_records_nothing(self):
         with workspace_tempdir() as tmpdir:
@@ -71,6 +86,7 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(sender.messages, [])
             self.assertNotIn("2611.00001", pipeline.registry)
+            pipeline.arxiv.commit_coverage.assert_not_called()
 
     def test_publication_update_is_announced_once(self):
         with workspace_tempdir() as tmpdir:

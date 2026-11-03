@@ -24,21 +24,24 @@ python bot.py --nosend --nosave  # dry run: shows what would be posted, changes 
 python bot.py --testchannel      # post to the test channel's webhook instead
 ```
 
-Other flags: `--days N` (look back N days instead of 7), `--rss` (use only
-the RSS feed of the latest announcement, skipping the API search),
-`--nomembersync` (skip the weekly website check), `--forcemembersync` (run it
-now).
+Other flags: `--api` (always run the API search too), `--rss` (never run it),
+`--days N` (minimum API search window, default 7), `--nomembersync` (skip the
+weekly website check), `--forcemembersync` (run it now).
 
 ## What a run does
 
 1. **Member sync (weekly):** reads `MEMBERS_PAGE_URL` and adds current members
    who aren't tracked yet to `tracked_authors.json` with `"source": "website"`,
    then sends a Telegram message if configured. It never removes anyone.
-2. **New papers:** asks the arXiv API for quant-ph papers by tracked authors
-   submitted in the last 7 days and posts those not in the registry yet. The
-   window overlaps earlier runs on purpose, so a late arXiv mailing or a few
-   days offline don't lose papers. If the API search fails (fully or for some
-   authors), the RSS feed of the latest announcement is read as a fallback.
+2. **New papers:** reads the quant-ph RSS feed (the latest daily
+   announcement) and posts papers by tracked authors that aren't in the
+   registry yet. The arXiv API is searched as well when something could be
+   missing: the feed is empty (announcement late) or unreadable, or
+   announcements were missed since the last one processed (bot offline, a
+   skipped mailing, a failed run). That search starts a few days before the
+   last processed announcement, at least `--days` back. An announcement is
+   recorded as processed in `last_rss_announcement.txt` only once all its
+   papers were posted and any gap before it was searched.
 3. **Publication updates:** for every posted paper not yet announced as
    published, checks arXiv for a DOI or journal reference, falling back to a
    Crossref title search, and posts a short "published" message.
@@ -50,6 +53,7 @@ now).
 | `config.py` | Webhook URLs, Crossref email, Telegram, DM-bot settings |
 | `tracked_authors.json` | Tracked authors: name, extra spellings, Discord ID for mentions, `manual`/`website` source |
 | `posted_papers.txt` | The registry: one JSON line per paper with its `posted`/`published` flags |
+| `last_rss_announcement.txt` | Latest arXiv announcement fully processed |
 | `last_member_sync.txt` | Date of the last website member sync |
 | `logs/bot-<hostname>.log` | Rotating log, one per machine |
 | `run.lock` | Present while a run is in progress, so two machines don't run at once |
@@ -75,8 +79,8 @@ Don't edit the registry while the bot is running.
 |---|---|
 | `bot.py` | Entry point: logging, run lock, member sync, then the pipeline |
 | `pipeline.py` | One run's logic; posts through a `send` function |
-| `arxiv_source.py` | arXiv API: author search over the window (RSS fallback), refresh by ID |
-| `rss_source.py` | Parses the arXiv RSS feed of the latest announcement |
+| `arxiv_source.py` | Finds new papers (RSS feed first, API search for gaps); refreshes known papers by ID |
+| `rss_source.py` | Parses the RSS feed of the latest announcement; tracks the last one processed |
 | `publication_check.py` | Decides whether tracked papers are now published |
 | `crossref.py` | Paced Crossref client, matching rules, citation formatting |
 | `registry.py` | The paper registry (load once, save atomically) |

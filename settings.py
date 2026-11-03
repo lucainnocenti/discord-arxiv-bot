@@ -38,6 +38,7 @@ class AppSettings:
     posted_papers_file: str = field(init=False)
     tracked_authors_file: str = field(init=False)
     last_member_sync_file: str = field(init=False)
+    rss_coverage_file: str = field(init=False)
 
     # Command-line flags
     no_save: bool = False
@@ -46,8 +47,10 @@ class AppSettings:
     member_sync_enabled: bool = True
     force_member_sync: bool = False
     lookback_days: int = DEFAULT_LOOKBACK_DAYS
-    # Read only the RSS feed instead of the API search (normally just a fallback).
+    # New papers come from the RSS feed, with the API search filling gaps.
+    # rss_only never runs the API search; force_api always runs it too.
     rss_only: bool = False
+    force_api: bool = False
 
     # Fetching parameters
     category: str = DEFAULT_CATEGORY
@@ -61,9 +64,12 @@ class AppSettings:
         self.posted_papers_file = os.path.join(self.script_dir, "posted_papers.txt")
         self.tracked_authors_file = os.path.join(self.script_dir, "tracked_authors.json")
         self.last_member_sync_file = os.path.join(self.script_dir, "last_member_sync.txt")
+        self.rss_coverage_file = os.path.join(self.script_dir, "last_rss_announcement.txt")
 
         if self.lookback_days < 1:
             raise ValueError("--days must be at least 1.")
+        if self.rss_only and self.force_api:
+            raise ValueError("--rss and --api are mutually exclusive.")
         if self.force_member_sync and not self.member_sync_enabled:
             raise ValueError("--forcemembersync is not compatible with --nomembersync.")
 
@@ -84,8 +90,9 @@ def load_settings() -> AppSettings:
     parser = argparse.ArgumentParser(description="Posts new and newly published arXiv papers by tracked authors to Discord.")
     parser.add_argument("--nosave", action="store_true", help="Don't write the paper registry or other state.")
     parser.add_argument("--nosend", action="store_true", help="Don't post anything to Discord.")
-    parser.add_argument("--days", type=int, default=DEFAULT_LOOKBACK_DAYS, help=f"Look for papers submitted in the last N days (default {DEFAULT_LOOKBACK_DAYS}).")
-    parser.add_argument("--rss", action="store_true", help="Use the arXiv RSS feed (latest announcement) instead of the API search; normally the feed is only a fallback.")
+    parser.add_argument("--days", type=int, default=DEFAULT_LOOKBACK_DAYS, help=f"Minimum window of the API search, in days (default {DEFAULT_LOOKBACK_DAYS}).")
+    parser.add_argument("--rss", action="store_true", help="Use only the RSS feed, never the gap-filling API search.")
+    parser.add_argument("--api", action="store_true", help="Also run the API search over the --days window, even if the feed covers everything.")
     parser.add_argument("--testchannel", action="store_true", help="Post to the test channel's webhook.")
     parser.add_argument("--nomembersync", action="store_true", help="Skip the weekly sync of new authors from the group website.")
     parser.add_argument("--forcemembersync", action="store_true", help="Run the website member sync even if it ran this week.")
@@ -114,6 +121,7 @@ def load_settings() -> AppSettings:
         force_member_sync=args.forcemembersync,
         lookback_days=args.days,
         rss_only=args.rss,
+        force_api=args.api,
     )
     if not settings.webhook_url and not settings.no_send:
         name = "DISCORD_TEST_WEBHOOK_URL" if settings.use_test_channel else "DISCORD_WEBHOOK_URL"

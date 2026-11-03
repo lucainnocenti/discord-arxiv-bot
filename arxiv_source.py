@@ -1,16 +1,16 @@
-"""Talks to arXiv: finds recent papers by tracked authors (API search, with the
-RSS feed as fallback) and refreshes metadata for already-known papers."""
+"""Talks to arXiv: finds recent papers by tracked authors (RSS feed for each
+day, API search for missed days) and refreshes metadata for known papers."""
 
 import asyncio
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import arxiv # Library for interacting with the arXiv API
 
 from models import FetchPapersByIdResult, Paper, canonicalize_paper_id, clean_optional_text
-from rss_source import fetch_rss_papers
+from rss_source import RssFeed, fetch_rss_feed, previous_announcement_day, read_last_covered, write_last_covered
 from settings import AppSettings
 from utils import find_matching_target_authors
 
@@ -22,6 +22,10 @@ MAX_AUTHORS_PER_QUERY = 20
 TRACKED_PAPER_REFRESH_CHUNK_SIZE = 10
 TRACKED_PAPER_REFRESH_CHUNK_DELAY_SECONDS = 5
 TRACKED_PAPER_REFRESH_RETRY_DELAYS_SECONDS = (60, 300)
+# How far before the last processed announcement the gap-filling API search
+# starts, and the furthest back it ever goes (e.g. after a long time offline).
+API_WINDOW_MARGIN_DAYS = 5
+MAX_CATCHUP_DAYS = 60
 
 
 class ArxivSource:
@@ -30,33 +34,45 @@ class ArxivSource:
         # page_size, delay_seconds, num_retries help manage API rate limits and transient errors.
         self.client = arxiv.Client(page_size=100, delay_seconds=3, num_retries=3)
         self.logger = logging.getLogger(self.__class__.__name__)
+        self._pending_coverage: Optional[date] = None
 
     async def search_recent(self) -> List[Paper]:
         """
         Fetches recent papers by tracked authors.
 
-        Primary source: an API search over the lookback window. The window
-        deliberately overlaps previous runs (the registry filters out what was
-        already posted), so a late or skipped arXiv mailing, or a few days with
-        the bot offline, never cause a paper to be missed.
+        Each day's papers come from the RSS feed of the latest announcement.
+        The API search fills gaps: it runs when the feed is empty or unreadable,
+        or when announcements were missed since the last one processed (bot
+        offline, a skipped mailing, a failed run). Its window starts a few days
+        before that last announcement and overlaps what was already posted;
+        the registry filters out duplicates.
 
-        Fallback: if any part of the API search fails, the RSS feed of the
-        latest announcement is read too and merged in. --rss uses only the feed.
+        After posting, call commit_coverage() to record the announcement as
+        processed; it is only recorded when nothing was left uncovered.
         """
-        if self.settings.rss_only:
-            self.logger.info("Using the RSS feed only (--rss).")
-            candidates = await self._rss_papers()
+        self._pending_coverage = None
+        feed = await self._read_feed()
+        candidates: List[Paper] = list(feed.papers) if feed else []
+        feed_has_papers = bool(feed and feed.papers and feed.announced)
+        last_covered = read_last_covered(self.settings.rss_coverage_file)
+
+        gap = self._coverage_gap(feed, last_covered)
+        api_complete = True
+        if gap and self.settings.rss_only:
+            self.logger.warning(f"Not running the API search although {gap} (--rss).")
+        elif gap:
+            since = self._api_window_start(last_covered)
+            self.logger.info(f"Running the API search because {gap}: papers submitted since {since:%Y-%m-%d %H:%M} UTC.")
+            api_papers, api_complete = await self._search_since(since)
+            known_ids = {paper.id for paper in candidates}
+            candidates += [paper for paper in api_papers if paper.id not in known_ids]
         else:
-            since = datetime.now(timezone.utc) - timedelta(days=self.settings.lookback_days)
-            self.logger.info(
-                f"Fetching target-author papers submitted since {since:%Y-%m-%d %H:%M} UTC "
-                f"({self.settings.lookback_days}-day window)."
-            )
-            candidates, complete = await self._search_since(since)
-            if not complete:
-                self.logger.warning("The arXiv API search was incomplete; falling back to the RSS feed.")
-                known_ids = {paper.id for paper in candidates}
-                candidates += [paper for paper in await self._rss_papers() if paper.id not in known_ids]
+            self.logger.info(f"The RSS feed follows the last processed announcement ({last_covered}); no API search needed.")
+
+        # The announcement counts as processed only if the feed had it and any
+        # gap before it was fully searched.
+        if feed_has_papers and (not gap or (not self.settings.rss_only and api_complete)):
+            self._pending_coverage = feed.announced
 
         # Both sources return more than we want (the API's au: search is loose,
         # the feed lists everyone), so keep only papers by a tracked author.
@@ -64,12 +80,46 @@ class ArxivSource:
         self.logger.info(f"Found {len(papers)} papers by tracked authors.")
         return papers
 
-    async def _rss_papers(self) -> List[Paper]:
+    def commit_coverage(self):
+        """Records the announcement from the last search_recent() as processed."""
+        if self._pending_coverage is None:
+            return
+        if self.settings.no_save:
+            self.logger.info(f"Not recording announcement {self._pending_coverage} as processed (--nosave).")
+            return
+        write_last_covered(self.settings.rss_coverage_file, self._pending_coverage)
+        self.logger.info(f"Recorded announcement {self._pending_coverage} as processed.")
+
+    def _coverage_gap(self, feed: Optional[RssFeed], last_covered: Optional[date]) -> Optional[str]:
+        """Why the API search is needed this run, or None if the feed suffices."""
+        if feed is None:
+            return "the RSS feed could not be read"
+        if not feed.papers or not feed.announced:
+            return "the RSS feed is empty"
+        if self.settings.force_api:
+            return "--api was given"
+        if last_covered is None:
+            return "no processed announcement is on record"
+        if feed.announced > last_covered and previous_announcement_day(feed.announced) > last_covered:
+            return f"announcements after {last_covered} and before {feed.announced} were not processed"
+        return None
+
+    def _api_window_start(self, last_covered: Optional[date]) -> datetime:
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(days=self.settings.lookback_days)
+        if last_covered:
+            # Papers announced after `last_covered` were submitted at most a few
+            # days before it (weekends); reach back far enough to include them.
+            gap_start = datetime.combine(last_covered, time.min, timezone.utc) - timedelta(days=API_WINDOW_MARGIN_DAYS)
+            since = min(since, gap_start)
+        return max(since, now - timedelta(days=MAX_CATCHUP_DAYS))
+
+    async def _read_feed(self) -> Optional[RssFeed]:
         try:
-            return await asyncio.to_thread(fetch_rss_papers, self.settings.category)
+            return await asyncio.to_thread(fetch_rss_feed, self.settings.category)
         except Exception as e:
             self.logger.error(f"Could not read the arXiv RSS feed: {type(e).__name__}: {e}")
-            return []
+            return None
 
     def is_author_match(self, paper_authors: List[str]) -> bool:
         """True if any tracked author (or one of their name variants) wrote the paper."""

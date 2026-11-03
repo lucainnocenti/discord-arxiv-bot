@@ -5,22 +5,29 @@ import os
 import socket
 import unittest
 import urllib.error
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 import arxiv_source
 import crossref
 from arxiv_source import ArxivSource
 from crossref import CrossrefClient
-from rss_source import parse_feed
+from rss_source import RssFeed, parse_feed, read_last_covered, write_last_covered
 from run_lock import LockHeldElsewhere, run_lock
 from tests.test_publication_tracking import make_paper, make_settings, workspace_tempdir
 
 
+TUESDAY, MONDAY, FRIDAY, THURSDAY = date(2026, 11, 3), date(2026, 11, 2), date(2026, 10, 30), date(2026, 10, 29)
+
+
 class RecentPapersTests(unittest.TestCase):
-    def run_search(self, *, api_papers=(), api_complete=True, rss_papers=(), **settings_overrides):
+    """RSS feed for the day's papers; API search only when something may be missing."""
+
+    def run_search(self, *, feed=None, feed_error=False, last_covered=None, api_papers=(), api_complete=True, **overrides):
         with workspace_tempdir() as tmpdir:
-            source = ArxivSource(make_settings(tmpdir, **settings_overrides))
+            source = ArxivSource(make_settings(tmpdir, **overrides))
+            if last_covered:
+                write_last_covered(source.settings.rss_coverage_file, last_covered)
             seen_since = []
 
             async def fake_api(since):
@@ -28,37 +35,78 @@ class RecentPapersTests(unittest.TestCase):
                 return list(api_papers), api_complete
 
             source._search_since = fake_api  # type: ignore[method-assign]
-            with patch.object(arxiv_source, "fetch_rss_papers", return_value=list(rss_papers)) as rss:
+            rss = dict(side_effect=OSError("down")) if feed_error else dict(return_value=feed)
+            with patch.object(arxiv_source, "fetch_rss_feed", **rss):
                 papers = asyncio.run(source.search_recent())
-        return [p.id for p in papers], seen_since, rss
+            source.commit_coverage()
+            covered = read_last_covered(source.settings.rss_coverage_file)
+        return [p.id for p in papers], seen_since, covered
 
-    def test_queries_lookback_window_and_keeps_only_tracked_authors(self):
-        tracked = make_paper(id="2611.00001")
-        namesake = make_paper(id="2611.00002", authors=["Alicia Exampleton"])
-        ids, seen_since, rss = self.run_search(api_papers=[tracked, namesake], lookback_days=7)
+    def test_consecutive_announcement_uses_only_the_feed(self):
+        feed = RssFeed(TUESDAY, [make_paper(id="2611.00001"), make_paper(id="2611.00002", authors=["Someone Else"])])
+        ids, seen_since, covered = self.run_search(feed=feed, last_covered=MONDAY)
 
+        self.assertEqual(ids, ["2611.00001"])
+        self.assertEqual(seen_since, [])
+        self.assertEqual(covered, TUESDAY)
+
+    def test_monday_follows_friday(self):
+        _, seen_since, covered = self.run_search(feed=RssFeed(MONDAY, [make_paper()]), last_covered=FRIDAY)
+        self.assertEqual(seen_since, [])
+        self.assertEqual(covered, MONDAY)
+
+    def test_missed_announcement_adds_api_search_from_before_the_gap(self):
+        feed = RssFeed(MONDAY, [make_paper(id="2611.00001")])
+        ids, seen_since, covered = self.run_search(
+            feed=feed, last_covered=THURSDAY, api_papers=[make_paper(id="2610.99999"), make_paper(id="2611.00001")],
+        )
+
+        self.assertEqual(ids, ["2611.00001", "2610.99999"])
+        self.assertLessEqual(seen_since[0].date(), THURSDAY - timedelta(days=5))
+        self.assertEqual(covered, MONDAY)
+
+    def test_empty_feed_uses_api_and_records_nothing(self):
+        ids, seen_since, covered = self.run_search(
+            feed=RssFeed(TUESDAY, []), last_covered=MONDAY, api_papers=[make_paper(id="2611.00001")], lookback_days=7,
+        )
         self.assertEqual(ids, ["2611.00001"])
         age = datetime.now(timezone.utc) - seen_since[0]
         self.assertAlmostEqual(age.total_seconds(), timedelta(days=7).total_seconds(), delta=60)
-        rss.assert_not_called()
+        self.assertEqual(covered, MONDAY)
 
-    def test_incomplete_api_search_falls_back_to_rss(self):
-        ids, _, rss = self.run_search(
-            api_papers=[make_paper(id="2611.00001")],
-            api_complete=False,
-            rss_papers=[make_paper(id="2611.00001"), make_paper(id="2611.00003"), make_paper(id="2611.00004", authors=["Someone Else"])],
-        )
-        rss.assert_called_once()
-        self.assertEqual(ids, ["2611.00001", "2611.00003"])
+    def test_unreadable_feed_uses_api(self):
+        ids, seen_since, covered = self.run_search(feed_error=True, last_covered=MONDAY, api_papers=[make_paper(id="2611.00001")])
+        self.assertEqual(ids, ["2611.00001"])
+        self.assertEqual(len(seen_since), 1)
+        self.assertEqual(covered, MONDAY)
 
-    def test_rss_only_skips_the_api(self):
-        ids, seen_since, _ = self.run_search(rss_papers=[make_paper(id="2611.00005")], rss_only=True)
-        self.assertEqual(ids, ["2611.00005"])
+    def test_incomplete_api_search_leaves_the_gap_open(self):
+        _, _, covered = self.run_search(feed=RssFeed(MONDAY, [make_paper()]), last_covered=THURSDAY, api_complete=False)
+        self.assertEqual(covered, THURSDAY)
+
+    def test_rss_only_never_calls_the_api_and_keeps_the_gap_open(self):
+        _, seen_since, covered = self.run_search(feed=RssFeed(MONDAY, [make_paper()]), last_covered=THURSDAY, rss_only=True)
         self.assertEqual(seen_since, [])
+        self.assertEqual(covered, THURSDAY)
+
+    def test_force_api_searches_even_without_a_gap(self):
+        _, seen_since, covered = self.run_search(feed=RssFeed(TUESDAY, [make_paper()]), last_covered=MONDAY, force_api=True)
+        self.assertEqual(len(seen_since), 1)
+        self.assertEqual(covered, TUESDAY)
+
+    def test_first_run_without_history_uses_api(self):
+        _, seen_since, covered = self.run_search(feed=RssFeed(TUESDAY, [make_paper()]))
+        self.assertEqual(len(seen_since), 1)
+        self.assertEqual(covered, TUESDAY)
+
+    def test_no_save_does_not_record(self):
+        _, _, covered = self.run_search(feed=RssFeed(TUESDAY, [make_paper()]), last_covered=MONDAY, no_save=True)
+        self.assertEqual(covered, MONDAY)
 
 
 RSS_FEED = b"""<?xml version='1.0' encoding='UTF-8'?>
 <rss xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0"><channel>
+<pubDate>Tue, 03 Nov 2026 00:00:00 -0500</pubDate>
 <item>
   <title>R\\'enyi entropies of things</title>
   <link>https://arxiv.org/abs/2611.00144</link>
@@ -85,7 +133,10 @@ Abstract: Old.</description>
 
 class RssParsingTests(unittest.TestCase):
     def test_parses_new_entries_and_skips_replacements(self):
-        papers = parse_feed(RSS_FEED)
+        feed = parse_feed(RSS_FEED)
+        papers = feed.papers
+
+        self.assertEqual(feed.announced, TUESDAY)
 
         self.assertEqual(len(papers), 1)
         paper = papers[0]
@@ -97,7 +148,8 @@ class RssParsingTests(unittest.TestCase):
         self.assertEqual(paper.announce_type, "rss_new")
 
     def test_empty_feed_gives_no_papers(self):
-        self.assertEqual(parse_feed(b"<rss version='2.0'><channel></channel></rss>"), [])
+        feed = parse_feed(b"<rss version='2.0'><channel><pubDate>Tue, 03 Nov 2026 00:00:00 -0500</pubDate></channel></rss>")
+        self.assertEqual(feed, RssFeed(TUESDAY, []))
 
 
 class CrossrefPacingTests(unittest.TestCase):
