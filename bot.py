@@ -12,6 +12,7 @@ from settings import load_settings, AppSettings, API_SOURCE, RSS_SOURCE
 from state_manager import PaperRecord, StateManager
 from arxiv_fetcher import ArxivFetcher, Paper, TrackedPaperMetadata
 from discord_formatter import format_paper_message
+from member_sync import sync_members_from_website
 
 def setup_logging(log_path: str):
     """Configures logging to file and console."""
@@ -355,6 +356,12 @@ async def run_bot():
         # The runtime is deliberately split into state, fetch, and Discord
         # layers so each concern can be tested or changed independently.
         state_manager = StateManager(settings)
+
+        # Weekly: pick up new group members before fetching so they count today.
+        added_authors = await asyncio.to_thread(sync_members_from_website, settings)
+        if added_authors:
+            settings.reload_tracked_authors()
+
         fetcher = ArxivFetcher(settings)
         # Formatter is functional, no class needed unless it grows state
 
