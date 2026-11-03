@@ -12,7 +12,7 @@ import logging
 import re
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo # For timezone handling (especially UTC and ET)
 import time # Needed for type hinting time.struct_time from feedparser
@@ -21,6 +21,10 @@ from typing import List, Dict, Any, NamedTuple, Optional, cast, Tuple # For type
 # Import settings and utilities from other modules in the project
 from settings import AppSettings, API_SOURCE, RSS_SOURCE
 from utils import decode_author_name, find_matching_target_authors
+
+# How far back the API fallback looks when the RSS feed is empty: covers a
+# weekend plus one skipped mailing.
+RSS_FALLBACK_LOOKBACK_DAYS = 4
 
 # Define a standard structure for paper data returned by the fetcher.
 # Using NamedTuple provides immutability and dot-notation access.
@@ -102,6 +106,10 @@ class ArxivFetcher:
         # page_size, delay_seconds, num_retries help manage API rate limits and transient errors.
         self.arxiv_client = arxiv.Client(page_size=100, delay_seconds=3, num_retries=3)
         self.logger = logging.getLogger(self.__class__.__name__) # Get a logger specific to this class
+        # True only after an RSS fetch that returned a non-empty feed. The bot
+        # uses this to avoid consuming the daily RSS slot on a failed or empty
+        # fetch (e.g. when arXiv's announcement is late).
+        self.last_rss_fetch_complete = False
 
     async def fetch_latest_papers(self, last_submission_date_api: datetime) -> List[Paper]:
         """
@@ -134,6 +142,8 @@ class ArxivFetcher:
             self.logger.info("Fetching papers using the arXiv RSS feed.")
             # feedparser is blocking, so run it in an executor thread to avoid blocking the event loop
             papers = await loop.run_in_executor(None, self._fetch_from_rss)
+            if not self.last_rss_fetch_complete:
+                papers = await self._fetch_rss_fallback_from_api()
 
         else:
             # This should ideally be caught by settings validation, but serves as a safeguard.
@@ -647,6 +657,7 @@ class ArxivFetcher:
         """
         feed_url = f"http://rss.arxiv.org/rss/{self.settings.category}"
         self.logger.info(f"Fetching RSS feed: {feed_url}")
+        self.last_rss_fetch_complete = False
 
         try:
             # Parse the feed. feedparser handles redirects (like 301) automatically.
@@ -674,6 +685,13 @@ class ArxivFetcher:
                  return []
 
             self.logger.info(f"RSS feed fetched successfully (final status: {getattr(feed, 'status', 'N/A')}), found {len(feed.entries)} entries.")
+            if not feed.entries:
+                 self.logger.warning(
+                     f"RSS feed is empty (feed pubDate: {feed.feed.get('published', 'N/A')}). "
+                     "Today's announcement is probably not out yet; a later run should retry."
+                 )
+                 return []
+            self.last_rss_fetch_complete = True
 
         except Exception as e:
             # Catch any other exceptions during feed fetching/parsing
@@ -698,6 +716,28 @@ class ArxivFetcher:
                  continue # Move to the next entry
 
         return papers
+
+    async def _fetch_rss_fallback_from_api(self) -> List[Paper]:
+        """
+        Queries the API for recent target-author papers when the RSS feed is empty
+        or unreachable (e.g. a late or skipped arXiv mailing).
+
+        The lookback window spans a weekend plus a skipped mailing; papers that
+        were already posted are filtered out downstream by the paper registry.
+        """
+        since = datetime.now(timezone.utc) - timedelta(days=RSS_FALLBACK_LOOKBACK_DAYS)
+        self.logger.info(
+            f"RSS feed unavailable; falling back to arXiv API for target-author papers "
+            f"submitted since {since:%Y-%m-%d %H:%M} UTC."
+        )
+        try:
+            api_papers = await self._fetch_from_api(since)
+        except Exception as e:
+            self.logger.exception(f"API fallback for empty RSS feed failed: {e}")
+            return []
+        # The API's au: search is looser than our matcher, so apply the same
+        # author check the RSS path uses.
+        return [paper for paper in api_papers if self._is_author_match(paper.authors)]
 
     def _is_author_match(self, paper_authors: List[str]) -> bool:
         """

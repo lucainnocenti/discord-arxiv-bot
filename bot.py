@@ -179,9 +179,13 @@ class ArxivBotClient(discord.Client):
              self.state_manager.save_last_api_check_time(latest_paper_time)
         elif self.settings.source == RSS_SOURCE:
              # Save RSS check time if we performed a check (didn't skip due to already checked)
-             # This covers cases where papers were found or where the check ran but found nothing new.
+             # and the feed actually had content. A failed or empty fetch must not
+             # consume today's slot, or a late arXiv announcement is never seen.
              if not self.state_manager.has_checked_rss_today() or self.settings.force_rss_check:
-                 self.state_manager.save_rss_check_time()
+                 if self.fetcher.last_rss_fetch_complete:
+                     self.state_manager.save_rss_check_time()
+                 else:
+                     self.logger.warning("RSS fetch failed or feed was empty; not marking RSS as checked today.")
 
     async def _hydrate_incomplete_paper_records(self) -> tuple[int, bool]:
         """Backfills title/author metadata for legacy or sparse registry records."""
