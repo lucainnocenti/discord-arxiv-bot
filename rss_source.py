@@ -1,4 +1,4 @@
-"""Reads the arXiv RSS feed for a category: the papers in the latest daily
+"""Reads the arXiv RSS feed for some categories: the papers in the latest daily
 announcement, and that announcement's date.
 
 The feed only holds the latest mailing (and is empty until it is out), so the
@@ -16,7 +16,8 @@ from pylatexenc.latex2text import LatexNodes2Text
 
 from models import Paper, canonicalize_paper_id, clean_optional_text
 
-RSS_URL = "https://rss.arxiv.org/rss/{category}"
+# arXiv merges "a+b" feeds into one, listing a paper in both categories once.
+RSS_URL = "https://rss.arxiv.org/rss/{categories}"
 # 'replace' entries are new versions of older papers, not new papers.
 NEW_PAPER_ANNOUNCE_TYPES = {"new", "cross"}
 NAMESPACES = {
@@ -35,9 +36,9 @@ class RssFeed(NamedTuple):
     papers: List[Paper]
 
 
-def fetch_rss_feed(category: str) -> RssFeed:
+def fetch_rss_feed(categories: List[str]) -> RssFeed:
     """Downloads and parses the feed; raises on network or HTTP errors."""
-    url = RSS_URL.format(category=category)
+    url = rss_url(categories)
     request = urllib.request.Request(url, headers={"User-Agent": "arxiv-discord-bot/1.0"})
     with urllib.request.urlopen(request, timeout=30) as response:
         xml_text = response.read()
@@ -47,6 +48,10 @@ def fetch_rss_feed(category: str) -> RssFeed:
     else:
         logger.info(f"RSS feed {url} lists {len(feed.papers)} new papers announced {feed.announced}.")
     return feed
+
+
+def rss_url(categories: List[str]) -> str:
+    return RSS_URL.format(categories="+".join(categories))
 
 
 def parse_feed(xml_text) -> RssFeed:

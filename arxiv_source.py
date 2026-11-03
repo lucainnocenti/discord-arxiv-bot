@@ -70,7 +70,7 @@ class ArxivSource:
                     send_telegram_message,
                     self.settings,
                     f"arxiv-bot on {socket.gethostname()}: {gap}. "
-                    f"Falling back to the arXiv API for {self.settings.category} papers "
+                    f"Falling back to the arXiv API for {', '.join(self.settings.categories)} papers "
                     f"submitted since {since:%Y-%m-%d %H:%M} UTC.",
                 )
             api_papers, api_complete = await self._search_since(since)
@@ -126,7 +126,7 @@ class ArxivSource:
 
     async def _read_feed(self) -> Optional[RssFeed]:
         try:
-            return await asyncio.to_thread(fetch_rss_feed, self.settings.category)
+            return await asyncio.to_thread(fetch_rss_feed, self.settings.categories)
         except Exception as e:
             self.logger.error(f"Could not read the arXiv RSS feed: {type(e).__name__}: {e}")
             return None
@@ -275,16 +275,17 @@ class ArxivSource:
             for i in range(0, len(authors), MAX_AUTHORS_PER_QUERY)
         ] or [[]]
 
+        category_query = _category_query(self.settings.categories)
         loop = asyncio.get_event_loop()
         unique_results: List[arxiv.Result] = []
         seen_entry_ids = set()
         complete = True
 
         for index, author_chunk in enumerate(author_chunks, start=1):
-            query = f'cat:{self.settings.category} AND submittedDate:[{date_query_str} TO 99991231235959]'
+            query = f'{category_query} AND submittedDate:[{date_query_str} TO 99991231235959]'
             if author_chunk:
                 authors_query = ' OR '.join(f'au:"{author}"' for author in author_chunk)
-                query = f'cat:{self.settings.category} AND ({authors_query}) AND submittedDate:[{date_query_str} TO 99991231235959]'
+                query = f'{category_query} AND ({authors_query}) AND submittedDate:[{date_query_str} TO 99991231235959]'
 
             self.logger.info(
                 f"Constructed API query chunk {index}/{len(author_chunks)} with "
@@ -352,6 +353,15 @@ def _paper_from_api_result(result: arxiv.Result) -> Paper:
         journal_ref=clean_optional_text(result.journal_ref),
         announce_type='api_new',
     )
+
+
+def _category_query(categories: List[str]) -> str:
+    """The API filter for papers in any of the categories, e.g.
+    (cat:quant-ph OR cat:cond-mat*). An archive with subcategories, such as
+    cond-mat, only matches with a wildcard: papers are filed under
+    cond-mat.mes-hall etc., never plain cond-mat."""
+    terms = [f"cat:{category}" if "." in category else f"cat:{category}*" for category in categories]
+    return terms[0] if len(terms) == 1 else f"({' OR '.join(terms)})"
 
 
 def _extract_http_status_code(error: Exception) -> Optional[int]:

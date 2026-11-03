@@ -12,7 +12,7 @@ import arxiv_source
 import crossref
 from arxiv_source import ArxivSource
 from crossref import CrossrefClient
-from rss_source import RssFeed, parse_feed, read_last_covered, write_last_covered
+from rss_source import RssFeed, parse_feed, read_last_covered, rss_url, write_last_covered
 from run_lock import LockHeldElsewhere, run_lock
 from tests.test_publication_tracking import make_paper, make_settings, workspace_tempdir
 
@@ -88,7 +88,7 @@ class RecentPapersTests(unittest.TestCase):
                 notify.assert_called_once()
                 message = notify.call_args.args[1]
                 self.assertIn("Falling back to the arXiv API", message)
-                self.assertIn("quant-ph", message)
+                self.assertIn("quant-ph, cond-mat", message)
 
     def test_no_rss_failure_alert_for_healthy_feeds_or_rss_only(self):
         cases = [
@@ -182,6 +182,15 @@ class RssParsingTests(unittest.TestCase):
     def test_empty_feed_gives_no_papers(self):
         feed = parse_feed(b"<rss version='2.0'><channel><pubDate>Tue, 03 Nov 2026 00:00:00 -0500</pubDate></channel></rss>")
         self.assertEqual(feed, RssFeed(TUESDAY, []))
+
+
+class CategoryTests(unittest.TestCase):
+    def test_feed_url_combines_categories(self):
+        self.assertEqual(rss_url(["quant-ph", "cond-mat"]), "https://rss.arxiv.org/rss/quant-ph+cond-mat")
+
+    def test_api_query_matches_archive_subcategories(self):
+        self.assertEqual(arxiv_source._category_query(["quant-ph", "cond-mat"]), "(cat:quant-ph* OR cat:cond-mat*)")
+        self.assertEqual(arxiv_source._category_query(["cond-mat.mes-hall"]), "cat:cond-mat.mes-hall")
 
 
 class CrossrefPacingTests(unittest.TestCase):

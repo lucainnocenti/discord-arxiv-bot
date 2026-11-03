@@ -9,7 +9,9 @@ from typing import Dict, List, Optional
 
 from tracked_authors import expand_discord_ids, expand_target_names, load_tracked_authors
 
-DEFAULT_CATEGORY = "quant-ph"
+# Several group members also publish in condensed matter. "cond-mat" is an
+# archive and covers all of its subcategories (cond-mat.mes-hall, ...).
+DEFAULT_CATEGORIES = ("quant-ph", "cond-mat")
 DEFAULT_MAX_RESULTS = 1000
 # arXiv announces papers up to ~4 days after submission (weekends, holidays,
 # skipped mailings), so a week-long window leaves a comfortable margin.
@@ -53,7 +55,7 @@ class AppSettings:
     force_api: bool = False
 
     # Fetching parameters
-    category: str = DEFAULT_CATEGORY
+    categories: List[str] = field(default_factory=lambda: list(DEFAULT_CATEGORIES))
     max_results: int = DEFAULT_MAX_RESULTS
 
     def __post_init__(self):

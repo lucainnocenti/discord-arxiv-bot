@@ -33,8 +33,8 @@ weekly website check), `--forcemembersync` (run it now).
 1. **Member sync (weekly):** reads `MEMBERS_PAGE_URL` and adds current members
    who aren't tracked yet to `tracked_authors.json` with `"source": "website"`,
    then sends a Telegram message if configured. It never removes anyone.
-2. **New papers:** reads the quant-ph RSS feed (the latest daily
-   announcement) and posts papers by tracked authors that aren't in the
+2. **New papers:** reads the combined quant-ph and cond-mat RSS
+   feed (the latest daily announcement; categories in `settings.py`) and posts papers by tracked authors that aren't in the
    registry yet. The arXiv API is searched as well when something could be
    missing: the feed is empty (announcement late) or unreadable, or
    announcements were missed since the last one processed (bot offline, a
