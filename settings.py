@@ -23,6 +23,11 @@ class AppSettings:
     target_authors: List[str]
     author_discord_ids: Dict[str, int]
     crossref_mailto: Optional[str] = None
+    # Incoming webhooks for the paper and test channels. When the one for the
+    # selected channel is set, messages are posted through it instead of
+    # logging the bot in.
+    discord_webhook_url: Optional[str] = None
+    discord_test_webhook_url: Optional[str] = None
 
     # File Paths (consider making these configurable too)
     script_dir: str = field(default_factory=lambda: os.path.dirname(os.path.abspath(__file__)))
@@ -67,6 +72,11 @@ class AppSettings:
         if self.force_member_sync and not self.member_sync_enabled:
              raise ValueError("--forcemembersync is not compatible with --nomembersync.")
 
+    @property
+    def webhook_url(self) -> Optional[str]:
+        """The webhook for the channel this run posts to, if one is configured."""
+        return self.discord_test_webhook_url if self.use_test_channel else self.discord_webhook_url
+
     def reload_tracked_authors(self):
         """Re-reads tracked_authors.json, e.g. after the website sync added names."""
         tracked = load_tracked_authors(self.tracked_authors_file, legacy_config=config)
@@ -109,6 +119,8 @@ def load_settings() -> AppSettings:
         # Crossref recommends including contact info in API requests so they can
         # reach the maintainer if the bot causes issues or needs coordination.
         crossref_mailto=os.getenv("CROSSREF_MAILTO", getattr(config, "CROSSREF_MAILTO", None)),
+        discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", getattr(config, "DISCORD_WEBHOOK_URL", None)),
+        discord_test_webhook_url=os.getenv("DISCORD_TEST_WEBHOOK_URL", getattr(config, "DISCORD_TEST_WEBHOOK_URL", None)),
         no_save=args.nosave,
         no_send=args.nosend,
         use_test_channel=args.testchannel,

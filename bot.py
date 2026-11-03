@@ -1,5 +1,6 @@
-"""Discord bot entrypoint: sets up logging and the run lock, then connects to
-Discord just long enough for one pipeline run to post its messages."""
+"""Discord bot entrypoint: sets up logging and the run lock, then runs the
+pipeline, posting through a channel webhook when one is configured and
+otherwise through a short-lived bot login."""
 
 import discord
 import asyncio
@@ -12,6 +13,7 @@ from logging.handlers import RotatingFileHandler
 from settings import load_settings, AppSettings
 from arxiv_source import ArxivSource
 from crossref import CrossrefClient
+from discord_webhook import WebhookSender
 from member_sync import sync_members_from_website
 from pipeline import Pipeline
 from publication_check import PublicationChecker
@@ -142,10 +144,15 @@ async def _run(settings: AppSettings):
     def pipeline_factory(send):
         return Pipeline(settings, registry, arxiv_source, publications, send)
 
-    bot = ArxivBotClient(settings=settings, pipeline_factory=pipeline_factory)
     try:
-        async with bot:
-            await bot.start(settings.discord_token, reconnect=False)
+        if settings.webhook_url:
+            # A webhook needs no login: post straight through it.
+            logging.info("Posting through the Discord webhook.")
+            await pipeline_factory(WebhookSender(settings.webhook_url)).run()
+        else:
+            bot = ArxivBotClient(settings=settings, pipeline_factory=pipeline_factory)
+            async with bot:
+                await bot.start(settings.discord_token, reconnect=False)
     finally:
         # Covers runs that fail midway; a no-op when nothing changed.
         registry.save()
