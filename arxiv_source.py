@@ -1,15 +1,16 @@
-"""Talks to the arXiv API: finds recent papers by tracked authors and refreshes
-metadata for already-known papers."""
+"""Talks to arXiv: finds recent papers by tracked authors (API search, with the
+RSS feed as fallback) and refreshes metadata for already-known papers."""
 
 import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import arxiv # Library for interacting with the arXiv API
 
 from models import FetchPapersByIdResult, Paper, canonicalize_paper_id, clean_optional_text
+from rss_source import fetch_rss_papers
 from settings import AppSettings
 from utils import find_matching_target_authors
 
@@ -32,23 +33,43 @@ class ArxivSource:
 
     async def search_recent(self) -> List[Paper]:
         """
-        Fetches tracked-author papers submitted within the lookback window.
+        Fetches recent papers by tracked authors.
 
-        The window deliberately overlaps previous runs: already-posted papers
-        are filtered out by the registry, so a late or skipped arXiv mailing,
-        or a few days with the bot offline, never cause a paper to be missed.
+        Primary source: an API search over the lookback window. The window
+        deliberately overlaps previous runs (the registry filters out what was
+        already posted), so a late or skipped arXiv mailing, or a few days with
+        the bot offline, never cause a paper to be missed.
+
+        Fallback: if any part of the API search fails, the RSS feed of the
+        latest announcement is read too and merged in. --rss uses only the feed.
         """
-        since = datetime.now(timezone.utc) - timedelta(days=self.settings.lookback_days)
-        self.logger.info(
-            f"Fetching target-author papers submitted since {since:%Y-%m-%d %H:%M} UTC "
-            f"({self.settings.lookback_days}-day window)."
-        )
-        api_papers = await self._search_since(since)
-        # The API's au: search is looser than our matcher, so keep only papers
-        # where a tracked author really appears.
-        papers = [paper for paper in api_papers if self.is_author_match(paper.authors)]
+        if self.settings.rss_only:
+            self.logger.info("Using the RSS feed only (--rss).")
+            candidates = await self._rss_papers()
+        else:
+            since = datetime.now(timezone.utc) - timedelta(days=self.settings.lookback_days)
+            self.logger.info(
+                f"Fetching target-author papers submitted since {since:%Y-%m-%d %H:%M} UTC "
+                f"({self.settings.lookback_days}-day window)."
+            )
+            candidates, complete = await self._search_since(since)
+            if not complete:
+                self.logger.warning("The arXiv API search was incomplete; falling back to the RSS feed.")
+                known_ids = {paper.id for paper in candidates}
+                candidates += [paper for paper in await self._rss_papers() if paper.id not in known_ids]
+
+        # Both sources return more than we want (the API's au: search is loose,
+        # the feed lists everyone), so keep only papers by a tracked author.
+        papers = [paper for paper in candidates if self.is_author_match(paper.authors)]
         self.logger.info(f"Found {len(papers)} papers by tracked authors.")
         return papers
+
+    async def _rss_papers(self) -> List[Paper]:
+        try:
+            return await asyncio.to_thread(fetch_rss_papers, self.settings.category)
+        except Exception as e:
+            self.logger.error(f"Could not read the arXiv RSS feed: {type(e).__name__}: {e}")
+            return []
 
     def is_author_match(self, paper_authors: List[str]) -> bool:
         """True if any tracked author (or one of their name variants) wrote the paper."""
@@ -168,8 +189,11 @@ class ArxivSource:
 
         return result(degraded)
 
-    async def _search_since(self, since: datetime) -> List[Paper]:
-        """Runs the category + author + submission-date search, chunked by author."""
+    async def _search_since(self, since: datetime) -> Tuple[List[Paper], bool]:
+        """
+        Runs the category + author + submission-date search, chunked by author.
+        Returns the papers found and whether every chunk succeeded.
+        """
         # arXiv's submittedDate filter takes YYYYMMDDHHMMSS in UTC.
         date_query_str = since.astimezone(timezone.utc).strftime("%Y%m%d%H%M%S")
 
@@ -194,6 +218,7 @@ class ArxivSource:
         loop = asyncio.get_event_loop()
         unique_results: List[arxiv.Result] = []
         seen_entry_ids = set()
+        complete = True
 
         for index, author_chunk in enumerate(author_chunks, start=1):
             query = f'cat:{self.settings.category} AND submittedDate:[{date_query_str} TO 99991231235959]'
@@ -235,6 +260,7 @@ class ArxivSource:
                         f"Error during arXiv API search for chunk {index}/{len(author_chunks)}: {e}",
                         exc_info=True,
                     )
+                    complete = False
                     break
 
             for api_result in chunk_results:
@@ -249,7 +275,7 @@ class ArxivSource:
                 await asyncio.sleep(3)
 
         unique_results.sort(key=lambda r: r.published)
-        return [_paper_from_api_result(api_result) for api_result in unique_results]
+        return [_paper_from_api_result(api_result) for api_result in unique_results], complete
 
 
 def _paper_from_api_result(result: arxiv.Result) -> Paper:

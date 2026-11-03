@@ -8,33 +8,96 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+import arxiv_source
 import crossref
 from arxiv_source import ArxivSource
 from crossref import CrossrefClient
+from rss_source import parse_feed
 from run_lock import LockHeldElsewhere, run_lock
 from tests.test_publication_tracking import make_paper, make_settings, workspace_tempdir
 
 
-class RollingWindowFetchTests(unittest.TestCase):
-    def test_queries_lookback_window_and_keeps_only_tracked_authors(self):
+class RecentPapersTests(unittest.TestCase):
+    def run_search(self, *, api_papers=(), api_complete=True, rss_papers=(), **settings_overrides):
         with workspace_tempdir() as tmpdir:
-            settings = make_settings(tmpdir)
-            settings.lookback_days = 7
-            source = ArxivSource(settings)
-            tracked = make_paper(id="2611.00001")
-            namesake = make_paper(id="2611.00002", authors=["Alicia Exampleton"])
+            source = ArxivSource(make_settings(tmpdir, **settings_overrides))
             seen_since = []
 
             async def fake_api(since):
                 seen_since.append(since)
-                return [tracked, namesake]
+                return list(api_papers), api_complete
 
             source._search_since = fake_api  # type: ignore[method-assign]
-            papers = asyncio.run(source.search_recent())
+            with patch.object(arxiv_source, "fetch_rss_papers", return_value=list(rss_papers)) as rss:
+                papers = asyncio.run(source.search_recent())
+        return [p.id for p in papers], seen_since, rss
 
-            self.assertEqual([p.id for p in papers], ["2611.00001"])
-            age = datetime.now(timezone.utc) - seen_since[0]
-            self.assertAlmostEqual(age.total_seconds(), timedelta(days=7).total_seconds(), delta=60)
+    def test_queries_lookback_window_and_keeps_only_tracked_authors(self):
+        tracked = make_paper(id="2611.00001")
+        namesake = make_paper(id="2611.00002", authors=["Alicia Exampleton"])
+        ids, seen_since, rss = self.run_search(api_papers=[tracked, namesake], lookback_days=7)
+
+        self.assertEqual(ids, ["2611.00001"])
+        age = datetime.now(timezone.utc) - seen_since[0]
+        self.assertAlmostEqual(age.total_seconds(), timedelta(days=7).total_seconds(), delta=60)
+        rss.assert_not_called()
+
+    def test_incomplete_api_search_falls_back_to_rss(self):
+        ids, _, rss = self.run_search(
+            api_papers=[make_paper(id="2611.00001")],
+            api_complete=False,
+            rss_papers=[make_paper(id="2611.00001"), make_paper(id="2611.00003"), make_paper(id="2611.00004", authors=["Someone Else"])],
+        )
+        rss.assert_called_once()
+        self.assertEqual(ids, ["2611.00001", "2611.00003"])
+
+    def test_rss_only_skips_the_api(self):
+        ids, seen_since, _ = self.run_search(rss_papers=[make_paper(id="2611.00005")], rss_only=True)
+        self.assertEqual(ids, ["2611.00005"])
+        self.assertEqual(seen_since, [])
+
+
+RSS_FEED = b"""<?xml version='1.0' encoding='UTF-8'?>
+<rss xmlns:arxiv="http://arxiv.org/schemas/atom" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0"><channel>
+<item>
+  <title>R\\'enyi entropies of things</title>
+  <link>https://arxiv.org/abs/2611.00144</link>
+  <description>arXiv:2611.00144v1 Announce Type: new
+Abstract: An abstract.</description>
+  <guid isPermaLink="false">oai:arXiv.org:2611.00144v1</guid>
+  <pubDate>Tue, 03 Nov 2026 00:00:00 -0500</pubDate>
+  <arxiv:announce_type>new</arxiv:announce_type>
+  <dc:creator>Alice Example, Jos\\'e Mart\\'in</dc:creator>
+  <arxiv:DOI>10.1/x</arxiv:DOI>
+</item>
+<item>
+  <title>An old paper, new version</title>
+  <link>https://arxiv.org/abs/2501.00001</link>
+  <description>arXiv:2501.00001v3 Announce Type: replace
+Abstract: Old.</description>
+  <guid isPermaLink="false">oai:arXiv.org:2501.00001v3</guid>
+  <pubDate>Tue, 03 Nov 2026 00:00:00 -0500</pubDate>
+  <arxiv:announce_type>replace</arxiv:announce_type>
+  <dc:creator>Alice Example</dc:creator>
+</item>
+</channel></rss>"""
+
+
+class RssParsingTests(unittest.TestCase):
+    def test_parses_new_entries_and_skips_replacements(self):
+        papers = parse_feed(RSS_FEED)
+
+        self.assertEqual(len(papers), 1)
+        paper = papers[0]
+        self.assertEqual(paper.id, "2611.00144")
+        self.assertEqual(paper.title, "Rényi entropies of things")
+        self.assertEqual(paper.authors, ["Alice Example", "José Martín"])
+        self.assertEqual(paper.summary, "An abstract.")
+        self.assertEqual(paper.doi, "10.1/x")
+        self.assertEqual(paper.announce_type, "rss_new")
+
+    def test_empty_feed_gives_no_papers(self):
+        self.assertEqual(parse_feed(b"<rss version='2.0'><channel></channel></rss>"), [])
 
 
 class CrossrefPacingTests(unittest.TestCase):

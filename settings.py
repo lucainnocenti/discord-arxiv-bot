@@ -46,6 +46,8 @@ class AppSettings:
     member_sync_enabled: bool = True
     force_member_sync: bool = False
     lookback_days: int = DEFAULT_LOOKBACK_DAYS
+    # Read only the RSS feed instead of the API search (normally just a fallback).
+    rss_only: bool = False
 
     # Fetching parameters
     category: str = DEFAULT_CATEGORY
@@ -83,6 +85,7 @@ def load_settings() -> AppSettings:
     parser.add_argument("--nosave", action="store_true", help="Don't write the paper registry or other state.")
     parser.add_argument("--nosend", action="store_true", help="Don't post anything to Discord.")
     parser.add_argument("--days", type=int, default=DEFAULT_LOOKBACK_DAYS, help=f"Look for papers submitted in the last N days (default {DEFAULT_LOOKBACK_DAYS}).")
+    parser.add_argument("--rss", action="store_true", help="Use the arXiv RSS feed (latest announcement) instead of the API search; normally the feed is only a fallback.")
     parser.add_argument("--testchannel", action="store_true", help="Post to the test channel's webhook.")
     parser.add_argument("--nomembersync", action="store_true", help="Skip the weekly sync of new authors from the group website.")
     parser.add_argument("--forcemembersync", action="store_true", help="Run the website member sync even if it ran this week.")
@@ -110,6 +113,7 @@ def load_settings() -> AppSettings:
         member_sync_enabled=not args.nomembersync,
         force_member_sync=args.forcemembersync,
         lookback_days=args.days,
+        rss_only=args.rss,
     )
     if not settings.webhook_url and not settings.no_send:
         name = "DISCORD_TEST_WEBHOOK_URL" if settings.use_test_channel else "DISCORD_WEBHOOK_URL"
