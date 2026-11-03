@@ -39,23 +39,21 @@ class RollingWindowFetchTests(unittest.TestCase):
 
 class CrossrefPacingTests(unittest.TestCase):
     def test_retries_once_after_rate_limit(self):
-        with workspace_tempdir() as tmpdir:
-            client = CrossrefClient()
-            rate_limited = urllib.error.HTTPError("url", 429, "Too Many Requests", {"Retry-After": "2"}, None)
-            ok = io.BytesIO(b'{"message": {}}')
-            with patch.object(crossref.urllib.request, "urlopen", side_effect=[rate_limited, ok]), \
-                    patch.object(crossref.time, "sleep") as sleep:
-                payload = client._get_json("https://example.org")
-            self.assertEqual(payload, {"message": {}})
-            self.assertIn(2.0, [call.args[0] for call in sleep.call_args_list])
+        client = CrossrefClient()
+        rate_limited = urllib.error.HTTPError("url", 429, "Too Many Requests", {"Retry-After": "2"}, None)
+        ok = io.BytesIO(b'{"message": {}}')
+        with patch.object(crossref.urllib.request, "urlopen", side_effect=[rate_limited, ok]), \
+                patch.object(crossref.time, "sleep") as sleep:
+            payload = client._get_json("https://example.org")
+        self.assertEqual(payload, {"message": {}})
+        self.assertIn(2.0, [call.args[0] for call in sleep.call_args_list])
 
     def test_other_errors_are_raised(self):
-        with workspace_tempdir() as tmpdir:
-            client = CrossrefClient()
-            server_error = urllib.error.HTTPError("url", 500, "Server Error", {}, None)
-            with patch.object(crossref.urllib.request, "urlopen", side_effect=server_error):
-                with self.assertRaises(urllib.error.HTTPError):
-                    client._get_json("https://example.org")
+        client = CrossrefClient()
+        server_error = urllib.error.HTTPError("url", 500, "Server Error", {}, None)
+        with patch.object(crossref.urllib.request, "urlopen", side_effect=server_error):
+            with self.assertRaises(urllib.error.HTTPError):
+                client._get_json("https://example.org")
 
 
 class RunLockTests(unittest.TestCase):

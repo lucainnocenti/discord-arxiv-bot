@@ -1,20 +1,16 @@
-# Byte-compiled / optimized / DLL files
+# Byte-compiled / test caches
 __pycache__/
-.pycache-check/
-.python-user/
+.pytest_cache/
 
-
-# Configuration file containing sensitive information
+# Private settings and data (synced between machines privately)
 config.py
 openai_apikey.py
-script.sh
-bot.log
-last_submission_date.txt
-last_rss_check.txt
-posted_papers.txt
-playground.ipynb
 tracked_authors.json
+posted_papers.txt
 last_member_sync.txt
+playground.ipynb
+
+# Runtime files
 logs/
 run.lock
 *.tmp

@@ -1,0 +1,24 @@
+{
+  "authors": [
+    {
+      "name": "Alice Example",
+      "source": "manual",
+      "group": "faculty",
+      "discord_id": 123456789012345678
+    },
+    {
+      "name": "Bianca Rossi",
+      "source": "manual",
+      "group": "phd",
+      "variations": ["Bianca Maria Rossi"]
+    },
+    {
+      "name": "New Member",
+      "source": "website",
+      "group": "postdoc",
+      "added": "2026-11-03",
+      "website_slug": "new-member"
+    }
+  ],
+  "ignored_website_names": ["Someone To Skip"]
+}

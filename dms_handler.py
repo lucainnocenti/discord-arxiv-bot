@@ -6,14 +6,10 @@ from discord.ext import commands
 import config
 
 DISCORD_TOKEN = config.DISCORD_TOKEN
-CHANNEL_ID = config.CHANNEL_ID
-TARGET_USER_ID = 1013801241295454268
-GUILD_ID = 1333218473014464522
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
+# DMs to the bot are forwarded to this user.
+TARGET_USER_ID = config.DMS_FORWARD_TO_USER_ID
+# Slash commands are registered on this server only.
+GUILD_ID = config.DMS_GUILD_ID
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -107,4 +103,9 @@ async def on_message(message: discord.Message):
 
     await client.process_commands(message)
 
-client.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    client.run(DISCORD_TOKEN)

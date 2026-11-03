@@ -31,9 +31,6 @@ def workspace_tempdir():
 
 def make_settings(script_dir: str, **overrides) -> AppSettings:
     values = dict(
-        discord_token="token",
-        channel_id=1,
-        test_channel_id=2,
         target_authors=["Alice Example", "Bob Example"],
         author_discord_ids={"Alice Example": 12345},
         script_dir=script_dir,
@@ -70,11 +67,12 @@ def make_checker(settings: AppSettings, refresh: FetchPapersByIdResult) -> Publi
 
 
 class RegistryTests(unittest.TestCase):
-    def test_reads_legacy_and_json_records(self):
+    def test_reads_records_and_skips_unreadable_lines(self):
         with workspace_tempdir() as tmpdir:
             path = make_settings(tmpdir).posted_papers_file
             with open(path, "w", encoding="utf-8") as handle:
-                handle.write("2601.12345\n")
+                handle.write(json.dumps({"id": "2601.12345", "posted": True}) + "\n")
+                handle.write("not json\n")
                 handle.write(json.dumps({
                     "id": "2602.23456",
                     "posted": True,
@@ -86,6 +84,7 @@ class RegistryTests(unittest.TestCase):
 
             registry = PaperRegistry.load(path)
 
+            self.assertEqual(len(registry), 2)
             self.assertEqual(registry.get("2601.12345"), PaperRecord(posted=True, published=False))
             self.assertEqual(registry.get("2602.23456").doi, "10.1000/example")
             self.assertTrue(registry.get("2602.23456").published)

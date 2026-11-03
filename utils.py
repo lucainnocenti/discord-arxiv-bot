@@ -1,20 +1,8 @@
 # utils.py
-import logging
 import re
 from typing import List
 
-from pylatexenc.latex2text import LatexNodes2Text
-
 AUTHOR_TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
-
-
-def decode_author_name(name: str) -> str:
-    """Converts LaTeX-style encoded strings to proper Unicode."""
-    try:
-        return LatexNodes2Text().latex_to_text(name)
-    except Exception as e:
-        logging.warning(f"Failed to decode LaTeX author name '{name}': {e}")
-        return name # Return original name on failure
 
 
 def author_names_match(left: str, right: str) -> bool:

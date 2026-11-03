@@ -36,7 +36,7 @@ class Pipeline:
         registry: PaperRegistry,
         arxiv_source: ArxivSource,
         publications: PublicationChecker,
-        send: SendFn,
+        send: Optional[SendFn],  # may be None on --nosend dry runs
     ):
         self.settings = settings
         self.registry = registry
@@ -44,7 +44,9 @@ class Pipeline:
         self.publications = publications
         self.send = send
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.handled_in_this_run: Set[str] = set()
+        # Guards against the same paper showing up twice within one run.
+        self.announced_new: Set[str] = set()
+        self.announced_published: Set[str] = set()
 
     async def run(self) -> RunSummary:
         summary = RunSummary()
@@ -63,9 +65,9 @@ class Pipeline:
             return
 
         for paper in papers:
-            if paper.id in self.handled_in_this_run:
+            if paper.id in self.announced_new:
                 continue
-            self.handled_in_this_run.add(paper.id)
+            self.announced_new.add(paper.id)
 
             # The fetch window overlaps earlier runs, so most papers here were
             # already posted; check that before spending any Crossref calls.
@@ -150,9 +152,9 @@ class Pipeline:
             )
 
         for paper in refresh.updates:
-            if f"published:{paper.id}" in self.handled_in_this_run:
+            if paper.id in self.announced_published:
                 continue
-            self.handled_in_this_run.add(f"published:{paper.id}")
+            self.announced_published.add(paper.id)
             # The flag is flipped only after a successful send, so each
             # publication is announced exactly once.
             if await self._announce(paper, "published"):

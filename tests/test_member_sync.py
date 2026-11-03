@@ -3,7 +3,6 @@ import shutil
 import tempfile
 import unittest
 from datetime import date, timedelta
-from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -87,22 +86,22 @@ class TrackedAuthorFileTests(unittest.TestCase):
         self.assertEqual([a.source for a in loaded.authors], [MANUAL_SOURCE, WEBSITE_SOURCE])
         self.assertEqual(loaded.authors[1].website_slug, "bob-example")
 
-    def test_bootstraps_from_legacy_config(self):
-        legacy = SimpleNamespace(names_variations={
-            "Dana Holt": ["D. Holt", "D Holt", "Dana A. Holt"],
-        })
-        loaded = load_tracked_authors(self.path, legacy_config=legacy)
-        self.assertTrue(os.path.exists(self.path))
-        self.assertEqual(loaded.authors[0].variations, ["Dana A. Holt"])
-        self.assertEqual(
-            expand_target_names(loaded),
-            ["Dana Holt", "D. Holt", "D Holt", "Dana A. Holt"],
-        )
+    def test_missing_file_is_an_error(self):
+        with self.assertRaises(ValueError):
+            load_tracked_authors(self.path)
 
-    def test_discord_ids_cover_name_variants(self):
-        tracked = TrackedAuthorList(authors=[TrackedAuthor("Alice Example")])
-        ids = expand_discord_ids(tracked, {"Alice Example": 7})
-        self.assertEqual(ids["A. Example"], 7)
+    def test_names_are_canonical_plus_explicit_variations(self):
+        tracked = TrackedAuthorList(authors=[TrackedAuthor("Dana Holt", variations=["Dana A. Holt"])])
+        self.assertEqual(expand_target_names(tracked), ["Dana Holt", "Dana A. Holt"])
+
+    def test_discord_ids_cover_name_variations(self):
+        tracked = TrackedAuthorList(authors=[
+            TrackedAuthor("Alice Example", variations=["Alice B. Example"], discord_id=7),
+            TrackedAuthor("Bob Example"),
+        ])
+        save_tracked_authors(self.path, tracked)
+        ids = expand_discord_ids(load_tracked_authors(self.path))
+        self.assertEqual(ids, {"Alice Example": 7, "Alice B. Example": 7})
 
 
 class SyncFlowTests(unittest.TestCase):
@@ -110,8 +109,7 @@ class SyncFlowTests(unittest.TestCase):
         self.tmpdir = os.path.join(tempfile.gettempdir(), f"test-sync-{uuid4().hex}")
         os.makedirs(self.tmpdir)
         self.settings = AppSettings(
-            discord_token="token", channel_id=1, test_channel_id=2,
-            target_authors=[], author_discord_ids={}, script_dir=self.tmpdir,
+            script_dir=self.tmpdir,
             members_page_url="https://example.org/people/",
         )
         save_tracked_authors(

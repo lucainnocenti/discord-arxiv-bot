@@ -1,12 +1,15 @@
 """Loads, expands, and persists the list of tracked authors.
 
-The list lives in a JSON file next to the bot so it can be edited by hand and
-extended automatically by the website member sync. Each entry records where
-it came from (`manual` or `website`) so auto-added names can be reviewed.
+The list lives in tracked_authors.json next to the bot so it can be edited by
+hand and extended automatically by the website member sync. Each entry records
+where it came from (`manual` or `website`) so auto-added names can be
+reviewed, plus optional extra spellings and a Discord user ID for mentions.
+
+Only full names and explicit variations are needed: the matcher in utils.py
+already accepts initials ("F. Last") and middle names for every entry.
 """
 
 import json
-import logging
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import date
@@ -21,8 +24,9 @@ class TrackedAuthor:
     name: str
     source: str = MANUAL_SOURCE
     group: Optional[str] = None
-    # Extra spellings beyond the automatic "F. Last" / "F Last" forms.
+    # Extra spellings the matcher cannot derive (e.g. a dropped middle name).
     variations: List[str] = field(default_factory=list)
+    discord_id: Optional[int] = None
     added: Optional[str] = None
     website_slug: Optional[str] = None
 
@@ -35,15 +39,10 @@ class TrackedAuthorList:
     ignored_website_names: List[str] = field(default_factory=list)
 
 
-def load_tracked_authors(path: str, legacy_config=None) -> TrackedAuthorList:
-    """Reads the tracked-author file, bootstrapping it from config.py if missing."""
+def load_tracked_authors(path: str) -> TrackedAuthorList:
+    """Reads the tracked-author file."""
     if not os.path.exists(path):
-        if legacy_config is None or not hasattr(legacy_config, "names_variations"):
-            raise ValueError(f"Tracked authors file not found: {path}")
-        tracked = _from_legacy_config(legacy_config)
-        save_tracked_authors(path, tracked)
-        logging.info(f"Created {path} from the author list in config.py ({len(tracked.authors)} authors).")
-        return tracked
+        raise ValueError(f"Tracked authors file not found: {path}")
 
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -54,6 +53,7 @@ def load_tracked_authors(path: str, legacy_config=None) -> TrackedAuthorList:
             source=entry.get("source", MANUAL_SOURCE),
             group=entry.get("group"),
             variations=list(entry.get("variations", [])),
+            discord_id=entry.get("discord_id"),
             added=entry.get("added"),
             website_slug=entry.get("website_slug"),
         )
@@ -82,15 +82,8 @@ def save_tracked_authors(path: str, tracked: TrackedAuthorList):
 
 
 def author_name_variants(author: TrackedAuthor) -> List[str]:
-    """Returns the canonical name, its initial forms, and any extra variations."""
-    variants = [author.name]
-    parts = author.name.split()
-    if len(parts) >= 2:
-        rest = " ".join(parts[1:])
-        variants.append(f"{parts[0][0]}. {rest}")
-        variants.append(f"{parts[0][0]} {rest}")
-    variants.extend(author.variations)
-    return _dedupe(variants)
+    """Returns the canonical name followed by any extra spellings."""
+    return _dedupe([author.name, *author.variations])
 
 
 def expand_target_names(tracked: TrackedAuthorList) -> List[str]:
@@ -101,15 +94,14 @@ def expand_target_names(tracked: TrackedAuthorList) -> List[str]:
     return _dedupe(names)
 
 
-def expand_discord_ids(tracked: TrackedAuthorList, discord_ids: Dict[str, int]) -> Dict[str, int]:
-    """Maps every name variant of a tracked author to that author's Discord ID."""
-    expanded = dict(discord_ids)
-    for author in tracked.authors:
-        if author.name not in discord_ids:
-            continue
-        for variant in author_name_variants(author):
-            expanded.setdefault(variant, discord_ids[author.name])
-    return expanded
+def expand_discord_ids(tracked: TrackedAuthorList) -> Dict[str, int]:
+    """Maps every name of each author with a Discord ID to that ID."""
+    return {
+        variant: author.discord_id
+        for author in tracked.authors
+        if author.discord_id
+        for variant in author_name_variants(author)
+    }
 
 
 def new_website_author(name: str, slug: Optional[str], group: Optional[str]) -> TrackedAuthor:
@@ -120,18 +112,6 @@ def new_website_author(name: str, slug: Optional[str], group: Optional[str]) -> 
         added=date.today().isoformat(),
         website_slug=slug,
     )
-
-
-def _from_legacy_config(legacy_config) -> TrackedAuthorList:
-    # Old config.py files expand TARGET_AUTHORS in place, but `names_variations`
-    # keeps the canonical names (as keys) in their original order.
-    authors = []
-    for name, variations in legacy_config.names_variations.items():
-        author = TrackedAuthor(name=name)
-        auto_variants = set(author_name_variants(author))
-        author.variations = [v for v in variations if v not in auto_variants]
-        authors.append(author)
-    return TrackedAuthorList(authors=authors)
 
 
 def _dedupe(values: List[str]) -> List[str]:

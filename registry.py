@@ -78,7 +78,7 @@ class PaperRegistry:
         return {pid: record for pid, record in self._records.items() if record.posted and not record.published}
 
     def missing_metadata(self) -> List[str]:
-        """Announced papers whose stored title or author list is empty (legacy records)."""
+        """Announced papers whose stored title or author list is empty."""
         return [pid for pid, record in self._records.items() if record.posted and (not record.title or not record.authors)]
 
     def record_paper(self, paper: Paper, *, posted: Optional[bool] = None, published: Optional[bool] = None) -> PaperRecord:
@@ -158,11 +158,7 @@ class PaperRegistry:
 
 
 def _parse_line(line: str) -> Tuple[Optional[str], PaperRecord]:
-    """Parses a registry line: a JSON record, or a bare arXiv ID (legacy format)."""
-    if not line.startswith("{"):
-        # Legacy format: one bare arXiv ID per line meant "already posted".
-        return canonicalize_paper_id(line), PaperRecord(posted=True)
-
+    """Parses one JSON registry line; unreadable lines are skipped with a warning."""
     try:
         data = json.loads(line)
         paper_id = data.get("id")

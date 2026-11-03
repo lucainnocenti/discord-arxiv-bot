@@ -1,0 +1,3 @@
+arxiv==2.1.3
+# Only needed for dms_handler.py; the paper bot posts through webhooks.
+discord.py==2.6.3
