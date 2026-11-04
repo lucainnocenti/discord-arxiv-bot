@@ -15,3 +15,4 @@ logs/
 run.lock
 *.tmp
 last_rss_announcement.txt
+bot.log
