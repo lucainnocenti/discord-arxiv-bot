@@ -63,6 +63,9 @@ CHANNEL_COOLDOWN_SECONDS = 10
 MAX_CALLS_PER_HOUR = 40
 MAX_REPLY_CHARS = 1500  # hard cap; the prompt asks for much less
 MAX_FORWARD_CHARS = 2000  # Discord's message limit
+# Replies may ping the people they mention, never everyone, here, or a role.
+REPLY_MENTIONS = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=False)
+MASS_MENTION = re.compile(r"@(everyone|here)\b")
 
 # "bot", "robot", "arxiv bot", "arXiv-bot", "bots", Italian "robottino"...
 NAME_PATTERN = re.compile(r"\b(?:arxiv[\s_-]?)?(?:ro)?bot(?:s|tino|tini|ty)?\b", re.IGNORECASE)
@@ -108,7 +111,12 @@ anyone, and stay away from offensive topics.
 - Reply in the language of the message you answer (often Italian or English).
 - Use emojis as liberally as the joke wants (😔 🫠 🤖 🧈 ⚛️ 📉 and the like): there is no \
 quota, one or none or a whole cascade of them, whatever makes the reply funnier.
-- Plain text otherwise: no @mentions, no @everyone, no links you weren't given.
+- You may @mention people from the conversation when it makes the reply funnier \
+(dragging someone in, calling back to what they said), writing exactly the \
+mention code listed for them, like <@123>. Use it sparingly, since it pings \
+them. Never write @everyone or @here, under any circumstances, and never \
+mention roles.
+- No links you weren't given.
 
 You see the latest messages of the conversation. If you need earlier context to \
 understand what people are referring to, call read_older_messages; most of the \
@@ -427,11 +435,10 @@ class Banter:
                 answer = await self.compose_reply(channel, history, burst)
         reply = answer.reply if answer else None
         if reply:
-            no_pings = discord.AllowedMentions.none()
             if burst.dm:  # a quoted reply in a one-to-one chat is just clutter
-                posted = await channel.send(reply, allowed_mentions=no_pings)
+                posted = await channel.send(reply, allowed_mentions=REPLY_MENTIONS)
             else:
-                posted = await answer.target.reply(reply, mention_author=False, allowed_mentions=no_pings)
+                posted = await answer.target.reply(reply, mention_author=False, allowed_mentions=REPLY_MENTIONS)
             self.recent_replies.append(reply)
             logger.info("Replied to %s in %s (burst of %d).", answer.target.author, channel, len(burst.messages))
         for message, emoji in answer.reactions if answer else []:
@@ -555,7 +562,13 @@ class Banter:
         recent = "".join(f"- {trim(r, HISTORY_MESSAGE_CHARS)}\n" for r in self.recent_replies)
         recent = (f"Your latest replies anywhere on the server, oldest first (find new material):\n"
                   f"<your_recent_replies>\n{recent}</your_recent_replies>\n\n") if recent else ""
-        return recent + (
+        people: Dict[int, str] = {}
+        for m in history + burst.messages:
+            if not self.is_ours(m) and not m.author.bot:
+                people[m.author.id] = m.author.display_name
+        people_line = ("People in this conversation, with the code to @mention them: "
+                       + ", ".join(f"{name} <@{uid}>" for uid, name in people.items()) + "\n\n") if people else ""
+        return recent + people_line + (
             f"Recent messages in {where}, oldest first:\n"
             f"<history>\n" + "\n".join(lines) + "\n</history>\n\n"
             f"New messages, oldest first:\n"
@@ -638,6 +651,8 @@ class Banter:
         if target is None and burst.direct():
             target = burst.direct()[-1]
         if reply and target is not None:
+            # Belt and braces: allowed mentions already stop the ping; drop the text too.
+            reply = MASS_MENTION.sub(r"\1", reply)
             answer.target, answer.reply = target, trim(reply, MAX_REPLY_CHARS)
         else:
             logger.info("Not replying in %s: Claude judged nothing addressed to the bot.", channel)

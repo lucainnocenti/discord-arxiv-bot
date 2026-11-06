@@ -230,6 +230,20 @@ class BanterFlowTests(unittest.TestCase):
         message.reply.assert_not_awaited()
 
 
+    def test_replies_may_ping_people_but_never_everyone(self):
+        banter, _ = make_banter(api_response(1, "@everyone look, <@2> is talking to me again @here"))
+        message = make_message("<@1> hi", mentions=[BOT_ID])
+        run(banter, message)
+
+        self.assertIn("Alice <@2>", prompt_of(banter))
+        args, kwargs = message.reply.await_args
+        self.assertEqual(args[0], "everyone look, <@2> is talking to me again here")
+        allowed = kwargs["allowed_mentions"]
+        self.assertTrue(allowed.users)
+        self.assertFalse(allowed.everyone)
+        self.assertFalse(allowed.roles)
+        self.assertFalse(allowed.replied_user)
+
 
 class BurstTests(unittest.TestCase):
     def conversation(self):
