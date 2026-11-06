@@ -93,7 +93,9 @@ def load_settings() -> AppSettings:
         members_page_url=private("MEMBERS_PAGE_URL"),
         telegram_bot_token=private("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=private("TELEGRAM_CHAT_ID"),
-        no_save=args.nosave,
+        # A test-channel run must not record anything: papers it marks as
+        # posted or published would never reach the real channel.
+        no_save=args.nosave or args.testchannel,
         no_send=args.nosend,
         use_test_channel=args.testchannel,
         member_sync_enabled=not args.nomembersync,
@@ -114,7 +116,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Posts new and newly published arXiv papers by tracked authors to Discord.")
     parser.add_argument("--nosave", action="store_true", help="Don't write the paper registry or other state.")
     parser.add_argument("--nosend", action="store_true", help="Don't post anything to Discord.")
-    parser.add_argument("--testchannel", action="store_true", help="Post to the test channel's webhook.")
+    parser.add_argument("--testchannel", action="store_true", help="Post to the test channel's webhook; implies --nosave.")
     parser.add_argument("--days", type=_positive_int, default=DEFAULT_LOOKBACK_DAYS, help=f"Minimum window of the API search, in days (default {DEFAULT_LOOKBACK_DAYS}).")
 
     source = parser.add_mutually_exclusive_group()

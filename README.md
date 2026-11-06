@@ -21,7 +21,7 @@ machines some other way (e.g. a shared cloud folder).
 ```bash
 python bot.py                    # a normal run
 python bot.py --nosend --nosave  # dry run: shows what would be posted, changes nothing
-python bot.py --testchannel      # post to the test channel's webhook instead
+python bot.py --testchannel      # post to the test channel's webhook instead; saves no state
 ```
 
 Other flags: `--api` (always run the API search too), `--rss` (never run it),
