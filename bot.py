@@ -10,8 +10,10 @@ import os
 import sys
 from logging.handlers import RotatingFileHandler
 
+from abstract_shortener import AbstractShortener
 from arxiv_api import ArxivApi
 from crossref import CrossrefClient
+from discord_formatter import discord_length
 from discord_webhook import WebhookSender
 from member_sync import sync_members_from_website
 from new_papers import NewPaperFinder
@@ -87,8 +89,13 @@ async def _run(settings: AppSettings):
     new_papers = NewPaperFinder(settings, api)
     publications = PublicationChecker(api, CrossrefClient(settings.crossref_mailto))
     send = WebhookSender(settings.webhook_url) if settings.webhook_url else None
+    if settings.anthropic_api_key:
+        shortener = AbstractShortener(settings.anthropic_api_key, measure=discord_length)
+    else:
+        shortener = None
+        logging.info("ANTHROPIC_API_KEY is not set: abstracts too long for a message will be truncated.")
     try:
-        await Pipeline(settings, registry, new_papers, publications, send).run()
+        await Pipeline(settings, registry, new_papers, publications, send, shortener).run()
     finally:
         # Covers runs that fail midway; a no-op when nothing changed.
         registry.save()

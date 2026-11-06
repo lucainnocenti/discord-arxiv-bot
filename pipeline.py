@@ -8,7 +8,7 @@ webhook sender in production, a fake in tests).
 import logging
 from typing import Awaitable, Callable, NamedTuple, Optional
 
-from discord_formatter import format_new_paper, format_publication
+from discord_formatter import Shortener, format_new_paper, format_publication
 from models import Paper
 from new_papers import NewPaperFinder
 from publication_check import PublicationChecker
@@ -34,12 +34,14 @@ class Pipeline:
         new_papers: NewPaperFinder,
         publications: PublicationChecker,
         send: Optional[SendFn],  # may be None on --nosend dry runs
+        shortener: Optional[Shortener] = None,  # condenses abstracts too long to post whole
     ):
         self.settings = settings
         self.registry = registry
         self.new_papers = new_papers
         self.publications = publications
         self.send = send
+        self.shortener = shortener
 
     async def run(self) -> RunSummary:
         posted = await self._post_new_papers()
@@ -70,7 +72,8 @@ class Pipeline:
             # Enrich before posting so the initial announcement already
             # includes DOI/journal data when arXiv or Crossref has it.
             paper = await self.publications.enrich(paper)
-            delivered = await self._announce(paper, format_new_paper(paper, self.settings.authors))
+            message = await format_new_paper(paper, self.settings.authors, self.shortener)
+            delivered = await self._announce(paper, message)
             if delivered:
                 posted += 1
                 self.registry.record_paper(paper, posted=True, published=bool(paper.journal_ref or paper.doi))

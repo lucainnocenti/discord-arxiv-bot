@@ -42,6 +42,11 @@ weekly website check), `--forcemembersync` (run it now).
    last processed announcement, at least `--days` back. An announcement is
    recorded as processed in `last_rss_announcement.txt` only once all its
    papers were posted and any gap before it was searched.
+   An abstract is posted unchanged whenever the message fits Discord's
+   2000-character limit, if need be with the author list shortened to
+   "First et al.". Only when it still doesn't fit does Claude condense it,
+   keeping the original wording (set `ANTHROPIC_API_KEY` in `config.py`;
+   without it, or if the call fails, the abstract is cut at a word).
 3. **Publication updates:** for every posted paper not yet announced as
    published, checks arXiv for a DOI or journal reference, falling back to a
    Crossref title search, and posts a short "published" message.
@@ -86,6 +91,7 @@ Don't edit the registry while the bot is running.
 | `crossref.py` | Paced Crossref client, matching rules, citation formatting |
 | `registry.py` | The paper registry (load once, save atomically) |
 | `discord_formatter.py` / `discord_webhook.py` | Message text / delivery |
+| `abstract_shortener.py` | Condenses, through the Claude API, abstracts too long to fit in a message |
 | `tracked_authors.py` | The tracked authors, how their names are matched, and their file |
 | `member_sync.py` | Website member sync |
 | `notifier.py`, `utils.py` | Telegram messages; the one-date state files |
@@ -94,7 +100,24 @@ Every module logs under its own name, e.g. `[new_papers]` in the log file.
 
 `other scripts/` holds unrelated helpers, such as `dms_handler.py`, a separate
 Discord bot for DM forwarding and channel commands. Their extra dependencies
-are in `other scripts/requirements.txt`.
+are in `other scripts/requirements.txt`. When `ANTHROPIC_API_KEY` is set,
+`dms_handler.py` also answers, in character, messages in the server's channels
+(any the bot can see, private ones included) that seem addressed to the bot or to the announcement webhook
+(`banter.py`: an @mention, a reply to a bot post, the word "bot", or a message
+right after a bot post; Claude decides the unclear cases). It waits for the
+channel to be quiet for 5 seconds, so a burst of messages gets a single
+reply, to the message meant for the bot, that also takes the others into
+account. Claude sees the last 20 messages and can ask for up to 150 older ones
+when it needs more context. DMs to the bot are always answered.
+Every message the rules above don't flag gets a quick look from Claude Haiku
+(at most 120 an hour). It adds emoji reactions to roughly one message in four or
+five, and sends the occasional message that deserves an answer (one about the
+bot that doesn't name it, a perfect setup for a joke) on to the main model,
+which decides as usual. Replies can come with reactions too.
+Every conversation with the bot, in a DM or a channel, is summarised in a DM
+to `DMS_FORWARD_TO_USER_ID` (except that user's own). It must be running
+to reply, needs the Message Content intent enabled in the developer portal, and
+caps itself at 40 Claude calls an hour.
 
 Run the tests with `python -m pytest`.
 

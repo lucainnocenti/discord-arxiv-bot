@@ -1,3 +1,5 @@
 arxiv==2.1.3
+# Condenses abstracts too long for a Discord message.
+anthropic==2.6.0
 # Decodes LaTeX accents in RSS-feed titles and author names.
 pylatexenc==2.10

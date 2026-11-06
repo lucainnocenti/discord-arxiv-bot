@@ -151,8 +151,7 @@ class FormatterTests(unittest.TestCase):
 
     def test_format_message_mentions_canonical_author_for_initial_variant(self):
         authors = tracked(TrackedAuthor("Carla Bianca Rossi", variations=["C. Bianca Rossi"], discord_id=54321))
-        message = format_new_paper(make_paper(authors=["Carla B. Rossi", "Bob Example"]), authors)
-
+        message = asyncio.run(format_new_paper(make_paper(authors=["Carla B. Rossi", "Bob Example"]), authors))
         self.assertIsNotNone(message)
         self.assertIn("**New paper by <@54321>**", message)
         self.assertNotIn("tracked authors", message)
@@ -161,11 +160,11 @@ class FormatterTests(unittest.TestCase):
     def test_one_person_is_mentioned_once_under_two_spellings(self):
         authors = tracked(TrackedAuthor("Dana Holt", variations=["Dana A. Holt"], discord_id=7), "Bob Example", "Eve Example")
         paper = make_paper(authors=["Dana Holt", "Bob Example", "D. A. Holt", "Eve Example"])
-        message = format_new_paper(paper, authors)
+        message = asyncio.run(format_new_paper(paper, authors))
         self.assertIn("**New paper by <@7>, Bob Example, and Eve Example**", message)
 
     def test_paper_without_tracked_authors_names_none(self):
-        message = format_new_paper(make_paper(authors=["Someone Else"]), DEFAULT_AUTHORS)
+        message = asyncio.run(format_new_paper(make_paper(authors=["Someone Else"]), DEFAULT_AUTHORS))
         self.assertIn("**New paper by tracked authors**", message)
 
 

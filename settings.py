@@ -31,6 +31,7 @@ class AppSettings:
     members_page_url: Optional[str] = None
     telegram_bot_token: Optional[str] = None
     telegram_chat_id: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
 
     # Command-line flags
     no_save: bool = False
@@ -93,6 +94,7 @@ def load_settings() -> AppSettings:
         members_page_url=private("MEMBERS_PAGE_URL"),
         telegram_bot_token=private("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=private("TELEGRAM_CHAT_ID"),
+        anthropic_api_key=private("ANTHROPIC_API_KEY"),
         # A test-channel run must not record anything: papers it marks as
         # posted or published would never reach the real channel.
         no_save=args.nosave or args.testchannel,
