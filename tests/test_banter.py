@@ -96,8 +96,8 @@ def make_banter(*responses, **options):
     return banter, clock
 
 
-def reaction_response(emojis, answer=False):
-    text = json.dumps({"answer": answer, "emojis": emojis})
+def reaction_response(emojis, answer=False, professional=False):
+    text = json.dumps({"answer": answer, "professional": professional, "emojis": emojis})
     return SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text=text)])
 
 
@@ -456,8 +456,32 @@ class ReactionTests(unittest.TestCase):
         kwargs = banter.anthropic.messages.create.await_args.kwargs
         self.assertEqual(kwargs["model"], "claude-haiku-5-5")
         self.assertIn("Alice: I finally got my paper accepted!", kwargs["messages"][0]["content"])
-        # Invalid emojis dropped, at most three.
-        self.assertEqual([c.args[0] for c in message.add_reaction.await_args_list], ["🧈", "😔", "🤖"])
+        # Invalid emojis dropped, at most two.
+        self.assertEqual([c.args[0] for c in message.add_reaction.await_args_list], ["🧈", "😔"])
+
+    def test_professional_messages_get_no_reactions(self):
+        banter, _ = make_banter()
+        banter.anthropic.messages.create.return_value = reaction_response(["🎉"], professional=True)
+        message = make_message("Group meeting moved to Thursday 10:00, please send slides by Wednesday.")
+        run(banter, message)
+        message.add_reaction.assert_not_awaited()
+
+    def test_reactions_need_an_explicit_casual_verdict(self):
+        banter, _ = make_banter()
+        text = json.dumps({"answer": False, "emojis": ["🎉"]})
+        banter.anthropic.messages.create.return_value = SimpleNamespace(
+            stop_reason="end_turn", content=[SimpleNamespace(type="text", text=text)])
+        message = make_message("lol")
+        run(banter, message)
+        message.add_reaction.assert_not_awaited()
+
+    def test_unprompted_reactions_have_an_hourly_cap(self):
+        banter, _ = make_banter()
+        banter.anthropic.messages.create.return_value = reaction_response(["🤖"])
+        messages = [make_message(f"lol {i}", author_id=10 + i) for i in range(5)]
+        run(banter, *messages, drain_each=True)
+        reacted = [m for m in messages if m.add_reaction.await_count]
+        self.assertEqual(len(reacted), 3)
 
     def test_no_reaction_by_default(self):
         banter, _ = make_banter()
