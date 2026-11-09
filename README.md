@@ -104,14 +104,17 @@ are in `other scripts/requirements.txt`. When `ANTHROPIC_API_KEY` is set,
 `dms_handler.py` also answers, in character, messages in the server's channels
 (any the bot can see, private ones included) that seem addressed to the bot or to the announcement webhook
 (`banter.py`: an @mention, a reply to a bot post, the word "bot", or a message
-right after a bot post; Claude decides the unclear cases). It waits for the
+right after a bot post; Claude decides the unclear cases). Only in the casual
+channels (`CASUAL_CHANNELS` in `config.py`, by default general, random, lunch
+and bot-testing-ground) does it chime in unprompted; elsewhere it reacts or
+replies only when addressed by mention, reply or name. It waits for the
 channel to be quiet for 5 seconds, so a burst of messages gets a single
 reply, to the message meant for the bot, that also takes the others into
 account. Claude sees the last 20 messages and can ask for up to 150 older ones
 when it needs more context. DMs to the bot are always answered.
-Every message the rules above don't flag gets a quick look from Claude Haiku
-(at most 120 an hour). It adds emoji reactions to roughly one message in four or
-five, and sends the occasional message that deserves an answer (one about the
+In the casual channels, every message the rules above don't flag gets a quick
+look from Claude Haiku (at most 120 an hour). It rarely adds emoji reactions
+(never to professional messages, at most 3 messages an hour), and sends the occasional message that deserves an answer (one about the
 bot that doesn't name it, a perfect setup for a joke) on to the main model,
 which decides as usual. Replies can come with reactions too.
 Every conversation with the bot, in a DM or a channel, is summarised in a DM

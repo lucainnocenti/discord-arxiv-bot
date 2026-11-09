@@ -48,6 +48,8 @@ banter = Banter(
     # Every conversation with the bot, in DMs or channels, is summarised to the operator.
     forward=send_to_operator,
     operator_id=TARGET_USER_ID,
+    # Channels where the bot may chime in unprompted; elsewhere only when addressed.
+    **({"casual_channels": config.CASUAL_CHANNELS} if hasattr(config, "CASUAL_CHANNELS") else {}),
 ) if ANTHROPIC_API_KEY else None
 
 @client.tree.command(

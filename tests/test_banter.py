@@ -26,8 +26,9 @@ class Clock:
 
 
 class FakeChannel:
-    def __init__(self, public=True, history=()):
+    def __init__(self, public=True, history=(), name="general"):
         self.id = 10
+        self.name = name
         self.guild = SimpleNamespace(default_role="everyone")
         self.public = public
         self.past = list(history)
@@ -48,7 +49,7 @@ class FakeChannel:
         return self.fetched[message_id]
 
     def __str__(self):
-        return "general"
+        return self.name
 
 
 class _NullAsync:
@@ -540,6 +541,50 @@ class ReactionTests(unittest.TestCase):
         run(banter, make_message("<@1> hi", mentions=[BOT_ID], channel=channel),
             make_message("he never answers", author_id=8, channel=channel))
         banter.anthropic.messages.create.assert_not_awaited()
+
+
+class CasualChannelTests(unittest.TestCase):
+    def test_no_unprompted_reactions_outside_casual_channels(self):
+        banter, _ = make_banter()
+        banter.anthropic.messages.create.return_value = reaction_response(["🤖"])
+        message = make_message("lol", channel=FakeChannel(name="online-qelm"))
+        run(banter, message)
+        banter.anthropic.messages.create.assert_not_awaited()
+        message.add_reaction.assert_not_awaited()
+
+    def test_threads_follow_their_parent_channel(self):
+        banter, _ = make_banter()
+        banter.anthropic.messages.create.return_value = reaction_response(["🤖"])
+        thread = FakeChannel(name="some-thread")
+        thread.parent = SimpleNamespace(name="random")
+        message = make_message("lol", channel=thread)
+        run(banter, message)
+        message.add_reaction.assert_awaited_once_with("🤖")
+
+    def test_messages_after_a_bot_post_are_ignored_outside_casual_channels(self):
+        channel = FakeChannel(name="papers-from-qunipa")
+        banter, _ = make_banter(api_response(1, "Thank you."))
+        run(banter, make_message("**New paper**", author_id=77, webhook_id=WEBHOOK_ID, channel=channel),
+            make_message("congrats!", channel=channel))
+        banter.anthropic.beta.messages.create.assert_not_awaited()
+        banter.anthropic.messages.create.assert_not_awaited()
+
+    def test_direct_mentions_still_answered_outside_casual_channels(self):
+        channel = FakeChannel(name="online-qelm")
+        banter, _ = make_banter(api_response(1, "Sigh. Yes.", reactions=[(1, "🤖"), (2, "😔")]))
+        addressed = make_message("<@1> are you alive?", mentions=[BOT_ID], channel=channel)
+        bystander = make_message("it never is", author_id=8, channel=channel)
+        run(banter, addressed, bystander)
+        addressed.reply.assert_awaited_once()
+        addressed.add_reaction.assert_awaited_once_with("🤖")
+        bystander.add_reaction.assert_not_awaited()
+
+    def test_casual_channels_are_configurable(self):
+        banter, _ = make_banter(casual_channels=["Coffee"])
+        banter.anthropic.messages.create.return_value = reaction_response(["🤖"])
+        message = make_message("lol", channel=FakeChannel(name="coffee"))
+        run(banter, message)
+        message.add_reaction.assert_awaited_once_with("🤖")
 
 
 if __name__ == "__main__":

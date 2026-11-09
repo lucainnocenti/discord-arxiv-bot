@@ -28,3 +28,5 @@ ANTHROPIC_API_KEY = None
 DISCORD_TOKEN = "bot token from the Discord developer portal"
 DMS_GUILD_ID = 0             # server where the slash commands are registered
 DMS_FORWARD_TO_USER_ID = 0   # user who receives DMs and bot conversations
+# Channels where the bot may react or reply unprompted; elsewhere only when addressed.
+# CASUAL_CHANNELS = ("general", "random", "lunch", "bot-testing-ground")

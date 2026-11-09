@@ -42,6 +42,11 @@ MAX_TRIAGE_CALLS_PER_HOUR = 120
 # messages per hour across the server, and never on professional messages.
 MAX_TRIAGE_REACTIONS_PER_HOUR = 3
 MAX_REACTIONS = 2  # per message
+# Only in these channels (and their threads) does the bot chime in unprompted:
+# the cheap model's look, and answering the messages right after its own posts.
+# Everywhere else it reacts or replies only when addressed (an @mention, a reply
+# to it, or its name), and only reacts to the messages that addressed it.
+CASUAL_CHANNELS = ("general", "random", "lunch", "bot-testing-ground")
 # Messages of channel history Claude sees before the one it answers.
 HISTORY_LIMIT = 20
 HISTORY_MESSAGE_CHARS = 500
@@ -259,6 +264,12 @@ def is_emoji(text: str) -> bool:
     return 0 < len(text) <= 16 and not any(c.isascii() and c not in "0123456789#*" for c in text)
 
 
+def channel_name(channel) -> str:
+    """A thread's name is its parent channel's, for deciding where the bot may chime in."""
+    channel = getattr(channel, "parent", None) or channel
+    return getattr(channel, "name", None) or str(channel)
+
+
 def is_dm(channel) -> bool:
     return getattr(channel, "type", None) == discord.ChannelType.private
 
@@ -328,7 +339,7 @@ class Banter:
                  quiet_seconds: float = QUIET_SECONDS, max_wait_seconds: float = MAX_WAIT_SECONDS,
                  dm_quiet_seconds: float = DM_QUIET_SECONDS,
                  forward: Optional[Callable[[str], Awaitable[None]]] = None, operator_id: Optional[int] = None,
-                 triage: bool = True):
+                 triage: bool = True, casual_channels: Iterable[str] = CASUAL_CHANNELS):
         """`forward`: called with a summary of each conversation, for the operator; their
         own conversations (`operator_id`) are not forwarded."""
         self.client = client
@@ -348,9 +359,14 @@ class Banter:
         self.recent_replies: Deque[str] = deque(maxlen=RECENT_REPLIES_SHOWN)
         # The cheap model's look at messages the rules don't flag (if off, those are ignored).
         self.triage = triage
+        self.casual_channels = {name.lower() for name in casual_channels}
         self.triage_budget = CallBudget(per_hour=MAX_TRIAGE_CALLS_PER_HOUR, cooldown=0, clock=clock)
         self.reaction_budget = CallBudget(per_hour=MAX_TRIAGE_REACTIONS_PER_HOUR, cooldown=0, clock=clock)
         self.triage_tasks: Set[asyncio.Task] = set()
+
+    def is_casual(self, channel) -> bool:
+        """DMs and the casual channels, where the bot may speak up unprompted."""
+        return is_dm(channel) or channel_name(channel).lower() in self.casual_channels
 
     def is_ours(self, message: discord.Message) -> bool:
         """Posted by the bot account or by one of the paper webhooks."""
@@ -385,6 +401,7 @@ class Banter:
         if message.author.bot:
             return
 
+        casual = self.is_casual(message.channel)
         target = await self._referenced(message)
         replies_to_bot = target is not None and self.is_ours(target)
         addressing = Addressing.DIRECT if dm else classify(
@@ -392,11 +409,12 @@ class Banter:
             mentions_bot=self._mentions_bot(message),
             replies_to_bot=replies_to_bot,
             # A Discord reply to someone else is talking to them, not to the bot.
-            follows_bot_post=follows_bot_post and target is None,
+            # Outside the casual channels, only messages actually addressed to the bot count.
+            follows_bot_post=follows_bot_post and target is None and casual,
         )
 
         if addressing is Addressing.NONE and channel_id not in self.bursts:
-            if self.triage and not dm:
+            if self.triage and casual and not dm:
                 task = asyncio.create_task(self._triage(message, target))
                 self.triage_tasks.add(task)
                 task.add_done_callback(self.triage_tasks.discard)
@@ -457,7 +475,9 @@ class Banter:
             self.recent_replies.append(reply)
             logger.info("Replied to %s in %s (burst of %d).", answer.target.author, channel, len(burst.messages))
         for message, emoji in answer.reactions if answer else []:
-            await self._react(message, emoji)
+            # Outside the casual channels, only the messages addressed to the bot get reactions.
+            if self.is_casual(channel) or message.id in burst.addressing:
+                await self._react(message, emoji)
         # Channel bursts the bot stays out of aren't conversations with it; DMs always are.
         if reply or burst.dm:
             await self._forward(burst, reply, posted)
