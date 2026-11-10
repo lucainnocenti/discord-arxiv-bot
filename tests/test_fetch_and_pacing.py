@@ -70,13 +70,17 @@ class RecentPapersTests(unittest.TestCase):
         self.assertEqual(covered, MONDAY)
 
     def test_empty_feed_uses_api_and_records_nothing(self):
+        # Dates relative to today: with a stale last_covered the window would
+        # (correctly) reach further back than the lookback.
+        today = datetime.now(timezone.utc).date()
+        yesterday = today - timedelta(days=1)
         ids, seen_since, covered = self.run_search(
-            feed=RssFeed(TUESDAY, []), last_covered=MONDAY, api_papers=[make_paper(id="2611.00001")], lookback_days=7,
+            feed=RssFeed(today, []), last_covered=yesterday, api_papers=[make_paper(id="2611.00001")], lookback_days=7,
         )
         self.assertEqual(ids, ["2611.00001"])
         age = datetime.now(timezone.utc) - seen_since[0]
         self.assertAlmostEqual(age.total_seconds(), timedelta(days=7).total_seconds(), delta=60)
-        self.assertEqual(covered, MONDAY)
+        self.assertEqual(covered, yesterday)
 
     def test_unreadable_feed_uses_api(self):
         ids, seen_since, covered = self.run_search(feed_error=True, last_covered=MONDAY, api_papers=[make_paper(id="2611.00001")])
