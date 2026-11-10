@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 import os
 import sys
 import unittest
@@ -11,7 +12,7 @@ from unittest.mock import AsyncMock
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "other scripts"))
 
 from banter import (  # noqa: E402
-    FOLLOW_UP_WINDOW_SECONDS, Addressing, Banter, CallBudget, classify, trim, webhook_id_from_url,
+    FIRST_COMMENT_WINDOW_SECONDS, FOLLOW_UP_WINDOW_SECONDS, Addressing, Banter, CallBudget, classify, trim, webhook_id_from_url,
 )
 
 BOT_ID, WEBHOOK_ID, GUILD_ID = 1, 99, 500
@@ -202,7 +203,7 @@ class BanterFlowTests(unittest.TestCase):
         channel = FakeChannel()
         banter, clock = make_banter()
         run(banter, (make_message("**New paper**", author_id=BOT_ID, bot=True, channel=channel)))
-        clock.now += FOLLOW_UP_WINDOW_SECONDS + 1
+        clock.now += FIRST_COMMENT_WINDOW_SECONDS + 1
         run(banter, (make_message("anyone around?", channel=channel)))
         banter.anthropic.beta.messages.create.assert_not_awaited()
 
@@ -561,13 +562,58 @@ class CasualChannelTests(unittest.TestCase):
         run(banter, message)
         message.add_reaction.assert_awaited_once_with("🤖")
 
-    def test_messages_after_a_bot_post_are_ignored_outside_casual_channels(self):
+    def test_first_comment_after_a_bot_post_is_answered_outside_casual_channels(self):
         channel = FakeChannel(name="papers-from-qunipa")
-        banter, _ = make_banter(api_response(1, "Thank you."))
-        run(banter, make_message("**New paper**", author_id=77, webhook_id=WEBHOOK_ID, channel=channel),
-            make_message("congrats!", channel=channel))
+        banter, clock = make_banter(api_response(1, "Very good, he says. I'll frame it."))
+        run(banter, make_message("**New paper**", author_id=77, bot=True, webhook_id=WEBHOOK_ID, channel=channel))
+        clock.now += 9 * 3600  # hours later, as comments on paper posts often are
+        comment = make_message("very good", channel=channel, name="Francesco")
+        run(banter, comment)
+        self.assertIn("[1] Francesco: very good", prompt_of(banter))
+        comment.reply.assert_awaited_once()
+
+    def test_later_messages_after_a_bot_post_are_ignored_outside_casual_channels(self):
+        channel = FakeChannel(name="papers-from-qunipa")
+        banter, _ = make_banter(api_response(0, ""))
+        run(banter, make_message("**New paper**", author_id=77, bot=True, webhook_id=WEBHOOK_ID, channel=channel),
+            make_message("congrats!", channel=channel), drain_each=True)
+        banter.anthropic.beta.messages.create.reset_mock()
+        run(banter, make_message("congrats from me too", author_id=8, channel=channel))
         banter.anthropic.beta.messages.create.assert_not_awaited()
         banter.anthropic.messages.create.assert_not_awaited()
+
+    def test_a_comment_replying_to_someone_else_is_not_for_the_bot(self):
+        channel = FakeChannel(name="papers-from-qunipa")
+        other = make_message("I'll present it on Friday", author_id=8, channel=channel)
+        channel.fetched[6] = other
+        banter, _ = make_banter()
+        run(banter, make_message("**New paper**", author_id=77, bot=True, webhook_id=WEBHOOK_ID, channel=channel),
+            make_message("great", channel=channel, reference=SimpleNamespace(message_id=6, resolved=None)))
+        banter.anthropic.beta.messages.create.assert_not_awaited()
+
+    def test_after_a_restart_the_bot_finds_its_last_post_in_the_history(self):
+        now = datetime(2026, 11, 10, 16, 0, tzinfo=timezone.utc)
+        post = make_message("**New paper**", author_id=77, bot=True, webhook_id=WEBHOOK_ID)
+        post.created_at = now - timedelta(hours=9)
+        comment = make_message("very good", name="Francesco")
+        comment.created_at = now
+        channel = FakeChannel(name="papers-from-qunipa", history=[post, comment])
+        post.channel = comment.channel = channel
+        banter, _ = make_banter(api_response(1, "Very good. Noted. Framed."))
+        run(banter, comment)
+        comment.reply.assert_awaited_once()
+
+    def test_after_a_restart_an_old_post_in_the_history_does_not_count(self):
+        now = datetime(2026, 11, 10, 16, 0, tzinfo=timezone.utc)
+        post = make_message("**New paper**", author_id=77, bot=True, webhook_id=WEBHOOK_ID)
+        post.created_at = now - timedelta(days=2)
+        comment = make_message("very good", name="Francesco")
+        comment.created_at = now
+        channel = FakeChannel(name="papers-from-qunipa", history=[post, comment])
+        post.channel = comment.channel = channel
+        banter, _ = make_banter()
+        run(banter, comment)
+        banter.anthropic.beta.messages.create.assert_not_awaited()
 
     def test_direct_mentions_still_answered_outside_casual_channels(self):
         channel = FakeChannel(name="online-qelm")

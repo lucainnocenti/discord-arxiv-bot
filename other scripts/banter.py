@@ -45,7 +45,8 @@ MAX_REACTIONS = 2  # per message
 # Only in these channels (and their threads) does the bot chime in unprompted:
 # the cheap model's look, and answering the messages right after its own posts.
 # Everywhere else it reacts or replies only when addressed (an @mention, a reply
-# to it, or its name), and only reacts to the messages that addressed it.
+# to it, its name, or the first comment after one of its posts), and only reacts
+# to the messages that addressed it.
 CASUAL_CHANNELS = ("general", "random", "lunch", "bot-testing-ground")
 # Messages of channel history Claude sees before the one it answers.
 HISTORY_LIMIT = 20
@@ -60,6 +61,9 @@ RECENT_REPLIES_SHOWN = 15
 # The first few messages within this long after a bot post may be reactions to it.
 FOLLOW_UP_WINDOW_SECONDS = 15 * 60
 FOLLOW_UP_MESSAGES = 3
+# In every channel, the first message after a bot post (within this long, and not a
+# reply to someone else) may be a comment on it, like "very good" under a paper.
+FIRST_COMMENT_WINDOW_SECONDS = 24 * 3600
 # After a message that might be for the bot, wait until the channel has been
 # quiet this long (but no longer than MAX_WAIT_SECONDS) before answering.
 QUIET_SECONDS = 5
@@ -141,8 +145,9 @@ when they are part of the same exchange (people chiming in on what was said \
 to you, joking about you). Set reply_to to that message's number.
 
 A message is addressed to you when it talks to you, asks you something, \
-reacts to one of your posts in a way that invites an answer, or talks about \
-you so that a reply would be natural and funny. People using the word "bot" \
+comments on one of your posts (praise or congratulations under a paper you \
+announced count: answer those briefly), or talks about you so that a reply \
+would be natural and funny. People using the word "bot" \
 about something else, or talking to each other, is not. If none of the new \
 messages is addressed to you, set reply_to to 0 and leave reply empty.
 
@@ -355,6 +360,8 @@ class Banter:
         self.budget = CallBudget(clock=clock)
         # Channel -> [time of the latest bot post, messages posted since].
         self.last_bot_post: Dict[int, List[float]] = {}
+        # Channels whose history was checked for a bot post from before a restart.
+        self.looked_back: Set[int] = set()
         self.bursts: Dict[int, Burst] = {}
         self.recent_replies: Deque[str] = deque(maxlen=RECENT_REPLIES_SHOWN)
         # The cheap model's look at messages the rules don't flag (if off, those are ignored).
@@ -392,16 +399,21 @@ class Banter:
         if self.is_ours(message):
             self.last_bot_post[channel_id] = [self.clock(), 0]
             return
+        if channel_id not in self.last_bot_post and channel_id not in self.looked_back:
+            await self._look_back(message)
+        casual = self.is_casual(message.channel)
         follows_bot_post = False
         if channel_id in self.last_bot_post:
             posted_at, since = self.last_bot_post[channel_id]
             self.last_bot_post[channel_id][1] = since + 1
-            follows_bot_post = since < FOLLOW_UP_MESSAGES and self.clock() - posted_at < FOLLOW_UP_WINDOW_SECONDS
+            age = self.clock() - posted_at
+            first_comment = since == 0 and age < FIRST_COMMENT_WINDOW_SECONDS
+            follow_up = casual and since < FOLLOW_UP_MESSAGES and age < FOLLOW_UP_WINDOW_SECONDS
+            follows_bot_post = first_comment or follow_up
         # Never answer other bots: two bots replying to each other never stops.
         if message.author.bot:
             return
 
-        casual = self.is_casual(message.channel)
         target = await self._referenced(message)
         replies_to_bot = target is not None and self.is_ours(target)
         addressing = Addressing.DIRECT if dm else classify(
@@ -409,8 +421,7 @@ class Banter:
             mentions_bot=self._mentions_bot(message),
             replies_to_bot=replies_to_bot,
             # A Discord reply to someone else is talking to them, not to the bot.
-            # Outside the casual channels, only messages actually addressed to the bot count.
-            follows_bot_post=follows_bot_post and target is None and casual,
+            follows_bot_post=follows_bot_post and target is None,
         )
 
         if addressing is Addressing.NONE and channel_id not in self.bursts:
@@ -420,6 +431,20 @@ class Banter:
                 task.add_done_callback(self.triage_tasks.discard)
             return
         self._add_to_burst(message, addressing, target, dm)
+
+    async def _look_back(self, message: discord.Message):
+        """After a restart the bot doesn't know its earlier posts: the first time it sees a
+        channel, checks whether the message before this one was a bot post."""
+        self.looked_back.add(message.channel.id)
+        try:
+            previous = [m async for m in message.channel.history(limit=1, before=message)]
+        except Exception as e:
+            logger.warning("Could not read history of %s: %s", message.channel, e)
+            return
+        if previous and self.is_ours(previous[0]):
+            then, now = getattr(previous[0], "created_at", None), getattr(message, "created_at", None)
+            age = (now - then).total_seconds() if then and now else 0
+            self.last_bot_post[message.channel.id] = [self.clock() - age, 0]
 
     def _add_to_burst(self, message: discord.Message, addressing: Addressing,
                       target: Optional[discord.Message], dm: bool = False):
@@ -597,7 +622,7 @@ class Banter:
                     f"answer: reply to one of them.")
         else:
             hint = (f"{flagged(Addressing.POSSIBLE)} may or may not be addressed to you or worth an answer "
-                    f"from you: they name a bot, come shortly after one of your posts, or looked like a "
+                    f"from you: they name a bot, come after one of your posts (perhaps commenting on it), or looked like a "
                     f"good opening for you at a first glance. Decide.")
         where = f"your DMs with {burst.messages[0].author.display_name}" if burst.dm else f"#{channel}"
         recent = "".join(f"- {trim(r, HISTORY_MESSAGE_CHARS)}\n" for r in self.recent_replies)

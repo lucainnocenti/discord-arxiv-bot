@@ -107,7 +107,8 @@ are in `other scripts/requirements.txt`. When `ANTHROPIC_API_KEY` is set,
 right after a bot post; Claude decides the unclear cases). Only in the casual
 channels (`CASUAL_CHANNELS` in `config.py`, by default general, random, lunch
 and bot-testing-ground) does it chime in unprompted; elsewhere it reacts or
-replies only when addressed by mention, reply or name. It waits for the
+replies only when addressed by mention, reply or name, or to the first
+comment after one of its posts (within a day). It waits for the
 channel to be quiet for 5 seconds, so a burst of messages gets a single
 reply, to the message meant for the bot, that also takes the others into
 account. Claude sees the last 20 messages and can ask for up to 150 older ones
